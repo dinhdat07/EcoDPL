@@ -39,73 +39,6 @@ class VGGPerceptualLoss(torch.nn.Module):
         return F.mse_loss(self.features(pred), self.features(target))
 
 
-class ParameterRegularizer:
-    def __init__(self, device, normalize_importance=True, mode="l1", importance_floor=0.0):
-        self.device = device
-        self.normalize_importance = normalize_importance
-        self.mode = mode
-        self.importance_floor = importance_floor
-        self.star = None
-        self.importance = None
-
-    def penalty(self, model):
-        if self.star is None or self.importance is None:
-            return torch.tensor(0.0, device=self.device)
-        total = torch.tensor(0.0, device=self.device)
-        count = 0
-        for param, star, importance in zip(model.parameters(), self.star, self.importance):
-            if not param.requires_grad:
-                continue
-            importance = importance.to(param.device)
-            if self.normalize_importance:
-                importance = importance / importance.detach().mean().clamp_min(1e-12)
-            if self.importance_floor > 0:
-                importance = importance + self.importance_floor
-            diff = param - star.to(param.device)
-            if self.mode == "l2":
-                total = total + torch.mean(importance * diff.square())
-            else:
-                total = total + torch.mean(importance * diff.abs())
-            count += 1
-        return total / max(count, 1)
-
-    @torch.no_grad()
-    def consolidate(self, model, loader, max_batches=50, pad_multiple=8, microbatch_size=4, use_amp=False, no_progress=False):
-        model.train()
-        importance = [torch.zeros_like(param, device=self.device) for param in model.parameters()]
-        seen = 0
-        for degraded, clean in tqdm(loader, total=min(len(loader), max_batches), desc="importance", leave=False, disable=no_progress):
-            degraded = degraded.to(self.device, non_blocking=True)
-            clean = clean.to(self.device, non_blocking=True)
-            model.zero_grad(set_to_none=True)
-            with torch.enable_grad():
-                if microbatch_size is None or microbatch_size <= 0:
-                    microbatch_size = degraded.shape[0]
-                degraded_chunks = degraded.split(microbatch_size)
-                clean_chunks = clean.split(microbatch_size)
-                chunk_count = len(degraded_chunks)
-                for degraded_chunk, clean_chunk in zip(degraded_chunks, clean_chunks):
-                    original_shape = degraded_chunk.shape[-2:]
-                    if pad_multiple and pad_multiple > 1:
-                        degraded_chunk, _ = pad_to_multiple(degraded_chunk, multiple=pad_multiple)
-                    with autocast_context(self.device, use_amp):
-                        restored = model(degraded_chunk)
-                        restored = crop_to_shape(restored, original_shape)
-                        loss = F.smooth_l1_loss(restored, clean_chunk) / chunk_count
-                    loss.backward()
-            for slot, param in zip(importance, model.parameters()):
-                if param.grad is not None:
-                    slot.add_(param.grad.detach().abs())
-            seen += 1
-            if seen >= max_batches:
-                break
-        if seen > 0:
-            importance = [slot / seen for slot in importance]
-        self.importance = importance
-        self.star = [param.detach().clone() for param in model.parameters()]
-        model.zero_grad(set_to_none=True)
-
-
 def build_train_loader(args, task, batch_size=None):
     train_set = H5DerainDataset(args.data_root, task, patch_size=args.patch_size, augment=True)
     return DataLoader(
@@ -170,19 +103,20 @@ def autocast_context(device, enabled):
 
 def load_compatible_state(model, state):
     result = model.load_state_dict(state, strict=False)
+    # Allow statistical memory missing keys when loading from standard models
     allowed_missing = {
-        "image_fuser.protected",
-        "feature_fuser.protected",
-        "image_fuser.dictionary",
-        "feature_fuser.dictionary",
+        "statistical_memory.background_mean",
+        "statistical_memory.background_cov",
+        "statistical_memory.task_means",
+        "statistical_memory.task_covs"
     }
     unexpected = list(result.unexpected_keys)
     missing = [key for key in result.missing_keys if key not in allowed_missing]
     if missing or unexpected:
-        raise RuntimeError(f"Checkpoint mismatch. Missing: {missing}; unexpected: {unexpected}")
+        print(f"Checkpoint mismatch warning. Missing: {missing}; unexpected: {unexpected}")
 
 
-def save_checkpoint(path, model, optimizer, scheduler, task_index, epoch, best_metric, regularizer):
+def save_checkpoint(path, model, optimizer, scheduler, task_index, epoch, best_metric):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
         {
@@ -192,8 +126,6 @@ def save_checkpoint(path, model, optimizer, scheduler, task_index, epoch, best_m
             "task_index": task_index,
             "epoch": epoch,
             "best_metric": best_metric,
-            "regularizer_star": [t.cpu() for t in regularizer.star] if regularizer.star is not None else None,
-            "regularizer_importance": [t.cpu() for t in regularizer.importance] if regularizer.importance is not None else None,
         },
         path,
     )
@@ -209,18 +141,17 @@ def load_model_weights(path, model, device):
     return checkpoint
 
 
-def load_regularizer_state(checkpoint, regularizer, device):
-    if not isinstance(checkpoint, dict):
-        return
-    star = checkpoint.get("regularizer_star")
-    importance = checkpoint.get("regularizer_importance")
-    if star is not None and importance is not None:
-        regularizer.star = [tensor.to(device) for tensor in star]
-        regularizer.importance = [tensor.to(device) for tensor in importance]
+def configure_trainable_parameters(model, scope, task_index):
+    # In EcoSMH we FREEZE BACKBONE for Task > 0.
+    if task_index == 0 and scope != "all":
+        print(f"Task 0 Warm-up: Forcing trainable_scope='all' to learn backbone representation.")
+        scope = "all"
 
+    for param in model.parameters():
+        param.requires_grad = False
 
-def configure_trainable_parameters(model, scope):
     if scope == "all":
+        print(f"Scope is 'all' - Training full network for task {task_index}.")
         for param in model.parameters():
             param.requires_grad = True
         return
@@ -236,8 +167,10 @@ def configure_trainable_parameters(model, scope):
             "output",
         ),
     }[scope]
+    
     for name, param in model.named_parameters():
-        param.requires_grad = any(marker in name for marker in trainable_markers)
+        if any(marker in name for marker in trainable_markers):
+            param.requires_grad = True
 
 
 def append_metric(path, row):
@@ -255,58 +188,17 @@ def log_metric(row):
     print("[metric] " + " ".join(parts), flush=True)
 
 
-def next_loader_batch(loaders, iterators, index):
-    try:
-        return next(iterators[index])
-    except StopIteration:
-        iterators[index] = iter(loaders[index])
-        return next(iterators[index])
-
-
-def maybe_consolidate_resume_state(args, model, regularizer, device, optimizer, scheduler):
-    if not args.consolidate_resume_task:
-        return
-    if regularizer.star is not None and regularizer.importance is not None and not args.force_consolidate_resume_state:
-        print("[checkpoint] resume state already has regularizer; skipping resume consolidation", flush=True)
-        return
-    train_loader, _ = build_loaders(args, args.consolidate_resume_task)
-    if args.grad_tune_resume_state:
-        model.grad_tune_prompts()
-    regularizer.consolidate(
-        model,
-        train_loader,
-        max_batches=args.importance_batches,
-        pad_multiple=args.train_pad_multiple,
-        microbatch_size=args.importance_batch_size,
-        use_amp=args.amp,
-        no_progress=args.no_progress,
-    )
-    save_checkpoint(
-        os.path.join(args.output_dir, f"consolidated_{args.consolidate_resume_task}.pth"),
-        model,
-        optimizer,
-        scheduler,
-        args.initial_task_index - 1,
-        0,
-        -1.0,
-        regularizer,
-    )
-    print(f"[checkpoint] consolidated resume state on {args.consolidate_resume_task}", flush=True)
-
-
 def main():
-    parser = argparse.ArgumentParser(description="Train EcoDPL for continual image deraining.")
+    parser = argparse.ArgumentParser(description="Train EcoSMH for rehearsal-free continual image deraining.")
     parser.add_argument("--data-root", default="/mnt/netdisk/liumh/workspace/Image-deraining")
-    parser.add_argument("--output-dir", default="runs/ecodpl_release")
+    parser.add_argument("--output-dir", default="runs/ecosmh_release")
     parser.add_argument("--tasks", nargs="+", default=["Rain800", "Rain100H"])
     parser.add_argument("--initial-task-index", type=int, default=0)
     parser.add_argument("--resume-state", default=None)
-    parser.add_argument("--consolidate-resume-task", default=None)
-    parser.add_argument("--force-consolidate-resume-state", action="store_true")
     parser.add_argument(
         "--trainable-scope",
         choices=["all", "prompts", "prompts_adapters", "prompts_adapters_output"],
-        default="all",
+        default="prompts_adapters_output",  # Default to backbone freeze
     )
     parser.add_argument("--epochs-per-task", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=4)
@@ -318,40 +210,27 @@ def main():
     parser.add_argument("--scheduler-t-max", type=int, default=None)
     parser.add_argument("--alpha", type=float, default=1.0)
     parser.add_argument("--perceptual-weight", type=float, default=0.04)
-    parser.add_argument("--omega", type=float, default=0.95)
-    parser.add_argument("--regularizer-mode", choices=["l1", "l2"], default="l1")
-    parser.add_argument("--importance-floor", type=float, default=0.0)
-    parser.set_defaults(normalize_importance=True, grad_tune_resume_state=True)
-    parser.add_argument("--normalize-importance", dest="normalize_importance", action="store_true")
-    parser.add_argument("--no-normalize-importance", dest="normalize_importance", action="store_false")
-    parser.add_argument("--grad-tune-resume-state", dest="grad_tune_resume_state", action="store_true")
-    parser.add_argument("--no-grad-tune-resume-state", dest="grad_tune_resume_state", action="store_false")
+    
+    # Loss scaling parameters for aux distillation
     parser.add_argument("--zeta", type=float, default=1e-5)
     parser.add_argument("--eta", type=float, default=1e-5)
     parser.add_argument("--prompt-reg", type=float, default=1e-4)
+    
     parser.add_argument("--num-prompts", type=int, default=100)
-    parser.add_argument("--grad-tuner-components", type=int, default=25)
-    parser.set_defaults(freeze_protected_prompts=True)
-    parser.add_argument("--freeze-protected-prompts", dest="freeze_protected_prompts", action="store_true")
-    parser.add_argument("--no-freeze-protected-prompts", dest="freeze_protected_prompts", action="store_false")
+    
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--eval-limit", type=int, default=None)
     parser.add_argument("--tile-size", type=int, default=384)
     parser.add_argument("--tile-overlap", type=int, default=32)
     parser.add_argument("--max-steps-per-epoch", type=int, default=None)
-    parser.add_argument("--retention-tasks", nargs="*", default=[])
-    parser.add_argument("--retention-weight", type=float, default=0.0)
-    parser.add_argument("--retention-batch-size", type=int, default=4)
-    parser.add_argument("--importance-batches", type=int, default=50)
-    parser.add_argument("--importance-batch-size", type=int, default=4)
+    
+    # Checkpointing arguments
     parser.set_defaults(restore_best_before_consolidation=True)
     parser.add_argument("--restore-best-before-consolidation", dest="restore_best_before_consolidation", action="store_true")
     parser.add_argument("--no-restore-best-before-consolidation", dest="restore_best_before_consolidation", action="store_false")
-    parser.set_defaults(save_latest=True, final_consolidation=True)
-    parser.add_argument("--save-latest", dest="save_latest", action="store_true")
+    parser.set_defaults(save_latest=True)
     parser.add_argument("--no-save-latest", dest="save_latest", action="store_false")
-    parser.add_argument("--final-consolidation", dest="final_consolidation", action="store_true")
-    parser.add_argument("--skip-final-consolidation", dest="final_consolidation", action="store_false")
+    
     parser.add_argument("--seed", type=int, default=123)
     parser.add_argument("--cuda", type=int, default=0)
     parser.add_argument("--no-perceptual", action="store_true")
@@ -361,29 +240,13 @@ def main():
 
     set_seed(args.seed)
     device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
-    model = EcoDPLPromptIR(num_prompts=args.num_prompts, grad_tuner_components=args.grad_tuner_components).to(device)
-    regularizer = ParameterRegularizer(
-        device,
-        normalize_importance=args.normalize_importance,
-        mode=args.regularizer_mode,
-        importance_floor=args.importance_floor,
-    )
+    
+    model = EcoDPLPromptIR(num_prompts=args.num_prompts).to(device)
+    
     if args.resume_state:
         checkpoint = load_model_weights(args.resume_state, model, device)
-        load_regularizer_state(checkpoint, regularizer, device)
         print(f"[checkpoint] resumed {args.resume_state}", flush=True)
-    configure_trainable_parameters(model, args.trainable_scope)
-    trainable_parameters = [param for param in model.parameters() if param.requires_grad]
-    if not trainable_parameters:
-        raise ValueError(f"No trainable parameters for trainable scope: {args.trainable_scope}")
-    optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=args.weight_decay)
-    scheduler_t_max = args.scheduler_t_max or args.epochs_per_task * len(args.tasks)
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer,
-        T_max=max(1, scheduler_t_max),
-        eta_min=args.lr * 0.01,
-    )
-    maybe_consolidate_resume_state(args, model, regularizer, device, optimizer, scheduler)
+        
     perceptual = None if args.no_perceptual else VGGPerceptualLoss().to(device)
     scaler = build_grad_scaler(device, args.amp)
 
@@ -396,15 +259,24 @@ def main():
     for local_task_index, task in enumerate(args.tasks):
         task_index = args.initial_task_index + local_task_index
         train_loader, eval_loader = build_loaders(args, task)
-        retention_loaders = []
-        retention_iterators = []
-        if task_index > 0 and args.retention_weight > 0 and args.retention_tasks:
-            retention_loaders = [
-                build_train_loader(args, retention_task, batch_size=args.retention_batch_size)
-                for retention_task in args.retention_tasks
-            ]
-            retention_iterators = [iter(loader) for loader in retention_loaders]
         best_metric = -1.0
+        
+        # --- Task-specific optimizer and trainable parameters ---
+        configure_trainable_parameters(model, args.trainable_scope, task_index)
+        trainable_parameters = [param for param in model.parameters() if param.requires_grad]
+        if not trainable_parameters:
+            raise ValueError(f"No trainable parameters for trainable scope: {args.trainable_scope}")
+            
+        optimizer = torch.optim.AdamW(trainable_parameters, lr=args.lr, weight_decay=args.weight_decay)
+        # CosineAnnealing per task
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer,
+            T_max=max(1, args.epochs_per_task),
+            eta_min=args.lr * 0.01,
+        )
+
+        # Before training a new task, backup protected prompts
+        model.backup_protected_prompts()
 
         for epoch in range(1, args.epochs_per_task + 1):
             model.train()
@@ -412,11 +284,13 @@ def main():
             steps_this_epoch = 0
             optimizer_steps = 0
             progress = tqdm(train_loader, desc=f"{task} epoch {epoch}/{args.epochs_per_task}", disable=args.no_progress)
+            
             for step, (degraded, clean) in enumerate(progress, start=1):
                 degraded = degraded.to(device, non_blocking=True)
                 clean = clean.to(device, non_blocking=True)
                 optimizer.zero_grad(set_to_none=True)
                 original_shape = degraded.shape[-2:]
+                
                 if args.train_pad_multiple and args.train_pad_multiple > 1:
                     degraded, _ = pad_to_multiple(degraded, multiple=args.train_pad_multiple)
 
@@ -426,47 +300,26 @@ def main():
                     loss = args.alpha * F.smooth_l1_loss(restored, clean)
                     loss = loss + args.zeta * aux["image_distance"] + args.eta * aux["feature_distance"]
                     loss = loss + args.prompt_reg * model.prompt_regularization_loss()
-                    if task_index > 0:
-                        loss = loss + args.omega * regularizer.penalty(model)
-                    if retention_loaders:
-                        retention_loss = torch.tensor(0.0, device=device)
-                        for retention_index in range(len(retention_loaders)):
-                            retention_degraded, retention_clean = next_loader_batch(
-                                retention_loaders,
-                                retention_iterators,
-                                retention_index,
-                            )
-                            retention_degraded = retention_degraded.to(device, non_blocking=True)
-                            retention_clean = retention_clean.to(device, non_blocking=True)
-                            retention_shape = retention_degraded.shape[-2:]
-                            if args.train_pad_multiple and args.train_pad_multiple > 1:
-                                retention_degraded, _ = pad_to_multiple(retention_degraded, multiple=args.train_pad_multiple)
-                            retention_restored = model(retention_degraded)
-                            retention_restored = crop_to_shape(retention_restored, retention_shape)
-                            retention_loss = retention_loss + F.smooth_l1_loss(retention_restored, retention_clean)
-                        loss = loss + args.retention_weight * retention_loss / len(retention_loaders)
+
                 if perceptual is not None and args.perceptual_weight > 0:
                     with autocast_context(device, False):
                         loss = loss + args.perceptual_weight * perceptual(restored.float(), clean.float())
 
                 if scaler.is_enabled():
-                    scale_before = scaler.get_scale()
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    if args.freeze_protected_prompts and task_index > 0:
-                        model.zero_protected_prompt_grads()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     scaler.step(optimizer)
                     scaler.update()
-                    if scaler.get_scale() >= scale_before:
-                        optimizer_steps += 1
+                    optimizer_steps += 1
                 else:
                     loss.backward()
-                    if args.freeze_protected_prompts and task_index > 0:
-                        model.zero_protected_prompt_grads()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     optimizer.step()
                     optimizer_steps += 1
+
+                # Restore protected prompts to reverse any weight decay from AdamW
+                model.restore_protected_prompts()
 
                 running_loss += loss.item()
                 steps_this_epoch = step
@@ -513,7 +366,6 @@ def main():
                         task_index,
                         epoch,
                         best_metric,
-                        regularizer,
                     )
             append_metric(metrics_path, row)
             log_metric(row)
@@ -526,30 +378,17 @@ def main():
                     task_index,
                     epoch,
                     best_metric,
-                    regularizer,
                 )
 
         best_path = os.path.join(args.output_dir, f"best_{task}.pth")
-        if not args.final_consolidation:
-            continue
+        
         if args.restore_best_before_consolidation and os.path.exists(best_path):
             load_model_weights(best_path, model, device)
-            print(f"[checkpoint] restored {best_path} before consolidation", flush=True)
+            print(f"[checkpoint] restored {best_path} before SMH update", flush=True)
 
-        model.grad_tune_prompts()
-        
         print(f"[SMH] Updating Statistical Memory for task {task_index}...", flush=True)
         model.update_task_statistics(task_index, train_loader, device)
 
-        regularizer.consolidate(
-            model,
-            train_loader,
-            max_batches=args.importance_batches,
-            pad_multiple=args.train_pad_multiple,
-            microbatch_size=args.importance_batch_size,
-            use_amp=args.amp,
-            no_progress=args.no_progress,
-        )
         save_checkpoint(
             os.path.join(args.output_dir, f"after_{task}.pth"),
             model,
@@ -558,7 +397,6 @@ def main():
             task_index,
             args.epochs_per_task,
             best_metric,
-            regularizer,
         )
 
 

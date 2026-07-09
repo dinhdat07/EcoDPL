@@ -220,6 +220,30 @@ class GMMStatisticalMemory(nn.Module):
         task_probs = F.softmax(task_scores / temperature, dim=1)
         return task_probs
 
+class SFTAdapter(nn.Module):
+    """Spatial Feature Transform (SFT) for adapting frozen backbone.
+    
+    Transforms prompts into affine transformation parameters (gamma, beta)
+    to modulate the backbone features.
+    """
+    def __init__(self, in_channels):
+        super().__init__()
+        self.conv_gamma = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1)
+        )
+        self.conv_beta = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.LeakyReLU(0.1, inplace=True),
+            nn.Conv2d(in_channels, in_channels, 3, padding=1)
+        )
+
+    def forward(self, x, prompt):
+        gamma = self.conv_gamma(prompt)
+        beta = self.conv_beta(prompt)
+        return x * (1 + gamma) + beta
+
 
 # ---------------------------------------------------------------------------
 # Fix #2: PromptFuser with Soft Mask Gating (replaces Logit Fusion)
@@ -251,14 +275,36 @@ class PromptFuser(nn.Module):
         self.attention = nn.Parameter(torch.ones(num_prompts, query_dim))
         self.values = nn.Parameter(torch.randn(num_prompts, *value_shape) * 0.02)
         self.register_buffer("frequency", torch.ones(num_prompts), persistent=True)
-        self.register_buffer("protected", torch.zeros(num_prompts, dtype=torch.bool), persistent=True)
-        self.register_buffer("dictionary", torch.zeros(num_prompts, value_dim), persistent=True)
         self.register_buffer("active", torch.ones(num_prompts, dtype=torch.bool), persistent=False)
 
         # Soft Mask Gating: stores normalized frequency profile per task
         # task_prompt_mask[t, p] = how relevant prompt p is to task t
         self.register_buffer(
             "task_prompt_mask", torch.zeros(10, num_prompts), persistent=True)
+            
+        # Hard-freezing buffer: stores which prompts belong exclusively to old tasks
+        self.register_buffer(
+            "protected_mask", torch.zeros(num_prompts, dtype=torch.bool), persistent=True)
+            
+        self.backup_keys = None
+        self.backup_values = None
+        self.backup_attention = None
+
+    @torch.no_grad()
+    def backup_protected_prompts(self):
+        """Backup protected prompts before training."""
+        self.backup_keys = self.keys.data.clone()
+        self.backup_values = self.values.data.clone()
+        self.backup_attention = self.attention.data.clone()
+
+    @torch.no_grad()
+    def restore_protected_prompts(self):
+        """Restore protected prompts to combat optimizer weight decay."""
+        if self.backup_keys is not None and self.protected_mask.any():
+            mask = self.protected_mask
+            self.keys.data[mask] = self.backup_keys[mask]
+            self.values.data[mask] = self.backup_values[mask]
+            self.attention.data[mask] = self.backup_attention[mask]
 
     def forward(self, query, update_frequency=False, soft_mask=None):
         """Forward pass with optional soft mask gating.
@@ -281,15 +327,14 @@ class PromptFuser(nn.Module):
 
         raw_logits = logits.clone()
 
-        # --- Soft Mask Gating (Fix #2) ---
-        # Multiply logits by soft mask instead of adding external logits.
-        # This preserves P-Fuser's instance-adaptive selection while
-        # constraining it to the correct task region.
+        # --- Additive Soft Mask Gating (Fix #2 + Fix Flaw) ---
+        # Additive log-masking mathematically zeros out Softmax for irrelevant tasks
+        # preserving P-Fuser's instance-adaptive selection cleanly.
         if soft_mask is not None:
-            # soft_mask: [B, num_prompts], values typically in [0.1, 1.0]
-            # We add a floor of 0.1 to prevent complete blocking
-            gated_mask = soft_mask.clamp(min=0.1)
-            logits = logits * gated_mask
+            # soft_mask: [B, num_prompts], values typically in [0.0, 1.0]
+            # Add log of mask. If mask -> 0, penalty -> -inf (blocks prompt entirely)
+            mask_penalty = torch.log(soft_mask.clamp(min=1e-6))
+            logits = logits + mask_penalty
 
         weights = F.softmax(logits, dim=1)
         fused = torch.einsum("bm,m...->b...", weights, self.values)
@@ -316,11 +361,18 @@ class PromptFuser(nn.Module):
         """Build task-prompt mask from accumulated frequency counts.
 
         Normalizes the current frequency buffer to [0, 1] and stores it
-        as the affinity profile for this task.
+        as the affinity profile for this task. Also locks heavily used prompts.
         """
         freq = self.frequency.float()
         max_freq = freq.max().clamp_min(1.0)
         self.task_prompt_mask[task_id] = freq / max_freq
+        
+        # Lock heavily used prompts (e.g. > 50% relative usage) to prevent weight decay
+        new_protected = (freq / max_freq) > 0.5
+        self.protected_mask = self.protected_mask | new_protected
+        
+        # Reset frequency for the next task
+        self.frequency.fill_(1.0)
 
     def compute_soft_mask(self, task_probs):
         """Convert task probabilities to per-prompt soft mask.
@@ -350,64 +402,6 @@ class PromptFuser(nn.Module):
     @torch.no_grad()
     def clear_active_range(self):
         self.active.fill_(True)
-
-    @torch.no_grad()
-    def grad_tune(self, keep_components=25):
-        keep_components = max(1, min(int(keep_components), self.num_prompts))
-        flat = self.values.data.reshape(self.num_prompts, -1)
-        frequency = self.frequency.float()
-        top_indices = torch.topk(frequency, k=keep_components, largest=True).indices
-        self.protected.zero_()
-        self.protected[top_indices] = True
-
-        mean = flat.mean(dim=0, keepdim=True)
-        data = flat - mean
-        atoms = F.normalize(data[top_indices].clone(), dim=1, eps=1e-12)
-        codes = torch.zeros(self.num_prompts, keep_components, device=flat.device, dtype=flat.dtype)
-        rows = torch.arange(self.num_prompts, device=flat.device)
-
-        for _ in range(4):
-            scores = data @ atoms.t()
-            assignment = scores.abs().argmax(dim=1)
-            codes.zero_()
-            codes[rows, assignment] = scores[rows, assignment]
-            reconstruction = codes @ atoms
-
-            for atom_index in range(keep_components):
-                mask = assignment == atom_index
-                if not bool(mask.any()):
-                    residual_norm = (data - reconstruction).pow(2).sum(dim=1)
-                    atoms[atom_index] = F.normalize(data[residual_norm.argmax()], dim=0, eps=1e-12)
-                    continue
-
-                residual = data[mask] - reconstruction[mask] + codes[mask, atom_index:atom_index + 1] * atoms[atom_index:atom_index + 1]
-                if residual.shape[0] == 1:
-                    atoms[atom_index] = F.normalize(residual[0], dim=0, eps=1e-12)
-                    codes[mask, atom_index] = residual[0].norm()
-                    continue
-
-                try:
-                    u, s, vh = torch.linalg.svd(residual, full_matrices=False)
-                except RuntimeError:
-                    continue
-                atoms[atom_index] = vh[0]
-                codes[mask, atom_index] = u[:, 0] * s[0]
-
-        compact = codes @ atoms + mean
-        usage = (frequency / frequency.max().clamp_min(1.0)).view(-1, 1)
-        blend = 0.35 * (1.0 - usage).clamp_min(0.1)
-
-        self.dictionary.zero_()
-        self.dictionary[:keep_components].copy_(atoms)
-        self.values.data.copy_((flat + blend * (compact - flat)).reshape_as(self.values.data))
-
-    def zero_protected_grads(self):
-        if not bool(self.protected.any()):
-            return
-        mask = self.protected.to(self.keys.device)
-        for tensor in (self.keys, self.attention, self.values):
-            if tensor.grad is not None:
-                tensor.grad[mask] = 0
 
 
 # ---------------------------------------------------------------------------
@@ -472,7 +466,7 @@ class EcoDPLPromptIR(nn.Module):
             query_dim=dim,
             value_shape=(inp_channels, image_prompt_size, image_prompt_size),
         )
-        self.image_prompt_adapter = nn.Conv2d(inp_channels * 2, inp_channels, 1, bias=bias)
+        self.image_prompt_adapter = SFTAdapter(inp_channels)
 
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
         self.encoder_level1 = nn.Sequential(*[
@@ -504,7 +498,7 @@ class EcoDPLPromptIR(nn.Module):
             query_dim=latent_dim,
             value_shape=(latent_dim, 1, 1),
         )
-        self.feature_prompt_adapter = nn.Conv2d(latent_dim * 2, latent_dim, 1, bias=bias)
+        self.feature_prompt_adapter = SFTAdapter(latent_dim)
 
         self.up4_3 = Upsample(latent_dim)
         self.reduce_chan_level3 = nn.Conv2d(int(dim * 8), int(dim * 4), 1, bias=bias)
@@ -572,7 +566,7 @@ class EcoDPLPromptIR(nn.Module):
         image_prompt, image_aux = self.image_fuser(
             query_feature, update_frequency=True, soft_mask=soft_mask_img)
         image_prompt = F.interpolate(image_prompt, size=(h, w), mode="bilinear", align_corners=False)
-        prompted_img = self.image_prompt_adapter(torch.cat([inp_img, image_prompt], dim=1))
+        prompted_img = self.image_prompt_adapter(inp_img, image_prompt)
 
         out_enc_level1 = self.encoder_level1(self.patch_embed(prompted_img))
         out_enc_level2 = self.encoder_level2(self.down1_2(out_enc_level1))
@@ -583,7 +577,7 @@ class EcoDPLPromptIR(nn.Module):
         feature_prompt, feature_aux = self.feature_fuser(
             feature_query, update_frequency=True, soft_mask=soft_mask_feat)
         feature_prompt = feature_prompt.expand(b, -1, latent.shape[-2], latent.shape[-1])
-        latent = self.feature_prompt_adapter(torch.cat([latent, feature_prompt], dim=1))
+        latent = self.feature_prompt_adapter(latent, feature_prompt)
 
         inp_dec_level3 = self.up4_3(latent)
         inp_dec_level3 = self._match_skip(inp_dec_level3, out_enc_level3)
@@ -643,6 +637,16 @@ class EcoDPLPromptIR(nn.Module):
     def zero_protected_prompt_grads(self):
         self.image_fuser.zero_protected_grads()
         self.feature_fuser.zero_protected_grads()
+
+    @torch.no_grad()
+    def backup_protected_prompts(self):
+        self.image_fuser.backup_protected_prompts()
+        self.feature_fuser.backup_protected_prompts()
+
+    @torch.no_grad()
+    def restore_protected_prompts(self):
+        self.image_fuser.restore_protected_prompts()
+        self.feature_fuser.restore_protected_prompts()
 
     @torch.no_grad()
     def update_task_statistics(self, task_id, dataloader, device):
