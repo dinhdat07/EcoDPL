@@ -35,6 +35,17 @@ class EcoSMHInvariantTests(unittest.TestCase):
         prompt = torch.randn(2, 4, 8, 8)
         self.assertTrue(torch.equal(adapter(image, prompt), image))
 
+    def test_sft_modulation_is_bounded(self):
+        limit = 0.25
+        adapter = SFTAdapter(
+            in_channels=1, prompt_channels=1, modulation_limit=limit
+        )
+        with torch.no_grad():
+            adapter.conv_beta[0].weight.fill_(1.0)
+            adapter.conv_beta[2].weight.fill_(1e6)
+        output = adapter(torch.zeros(1, 1, 2, 2), torch.ones(1, 1, 2, 2))
+        self.assertLessEqual(float(output.abs().max()), limit)
+
     def test_gmm_likelihood_is_finite_normalized_and_separates_tasks(self):
         memory = GMMStatisticalMemory(
             feature_dim=2,

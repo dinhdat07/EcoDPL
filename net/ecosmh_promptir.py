@@ -255,10 +255,13 @@ class GMMStatisticalMemory(nn.Module):
 
 class SFTAdapter(nn.Module):
     """Per-image FiLM adapter driven by a global prompt vector."""
-    def __init__(self, in_channels, prompt_channels=None):
+    def __init__(self, in_channels, prompt_channels=None, modulation_limit=1.0):
         super().__init__()
         if prompt_channels is None:
             prompt_channels = in_channels
+        if modulation_limit is not None and modulation_limit <= 0:
+            raise ValueError("modulation_limit must be positive or None")
+        self.modulation_limit = modulation_limit
         self.conv_gamma = nn.Sequential(
             nn.Conv2d(prompt_channels, in_channels, 1, padding=0, bias=False),
             nn.LeakyReLU(0.1, inplace=True),
@@ -324,6 +327,13 @@ class SFTAdapter(nn.Module):
             )
         gamma = self.conv_gamma[2](gamma_hidden)
         beta = self.conv_beta[2](beta_hidden)
+        if self.modulation_limit is not None:
+            gamma = gamma.clamp(
+                min=-self.modulation_limit, max=self.modulation_limit
+            )
+            beta = beta.clamp(
+                min=-self.modulation_limit, max=self.modulation_limit
+            )
         return x * (1 + gamma) + beta
 
 
@@ -539,6 +549,7 @@ class EcoDPLPromptIR(nn.Module):
         max_tasks=10,
         router_temperature=1.0,
         covariance_shrinkage=0.1,
+        adapter_modulation_limit=1.0,
     ):
         super().__init__()
         if num_blocks is None:
@@ -574,28 +585,44 @@ class EcoDPLPromptIR(nn.Module):
             value_shape=(dim, 1, 1),
             max_tasks=max_tasks,
         )
-        self.image_prompt_adapter = SFTAdapter(inp_channels, prompt_channels=dim)
+        self.image_prompt_adapter = SFTAdapter(
+            inp_channels,
+            prompt_channels=dim,
+            modulation_limit=adapter_modulation_limit,
+        )
 
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
         self.encoder_level1 = nn.Sequential(*[
             TransformerBlock(dim=dim, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[0])
         ])
-        self.adapter_enc_level1 = SFTAdapter(in_channels=dim, prompt_channels=dim)
+        self.adapter_enc_level1 = SFTAdapter(
+            in_channels=dim,
+            prompt_channels=dim,
+            modulation_limit=adapter_modulation_limit,
+        )
 
         self.down1_2 = Downsample(dim)
         self.encoder_level2 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[1])
         ])
-        self.adapter_enc_level2 = SFTAdapter(in_channels=int(dim * 2), prompt_channels=dim)
+        self.adapter_enc_level2 = SFTAdapter(
+            in_channels=int(dim * 2),
+            prompt_channels=dim,
+            modulation_limit=adapter_modulation_limit,
+        )
 
         self.down2_3 = Downsample(int(dim * 2))
         self.encoder_level3 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 4), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[2])
         ])
-        self.adapter_enc_level3 = SFTAdapter(in_channels=int(dim * 4), prompt_channels=dim)
+        self.adapter_enc_level3 = SFTAdapter(
+            in_channels=int(dim * 4),
+            prompt_channels=dim,
+            modulation_limit=adapter_modulation_limit,
+        )
 
         self.down3_4 = Downsample(int(dim * 4))
         self.latent_dim = int(dim * 8)
@@ -610,7 +637,9 @@ class EcoDPLPromptIR(nn.Module):
             value_shape=(self.latent_dim, 1, 1),
             max_tasks=max_tasks,
         )
-        self.feature_prompt_adapter = SFTAdapter(self.latent_dim)
+        self.feature_prompt_adapter = SFTAdapter(
+            self.latent_dim, modulation_limit=adapter_modulation_limit
+        )
 
         self.up4_3 = Upsample(self.latent_dim)
         self.reduce_chan_level3 = nn.Conv2d(int(dim * 8), int(dim * 4), kernel_size=1, bias=bias)
@@ -618,7 +647,11 @@ class EcoDPLPromptIR(nn.Module):
             TransformerBlock(dim=int(dim * 4), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[2])
         ])
-        self.adapter_dec_level3 = SFTAdapter(in_channels=int(dim * 4), prompt_channels=self.latent_dim)
+        self.adapter_dec_level3 = SFTAdapter(
+            in_channels=int(dim * 4),
+            prompt_channels=self.latent_dim,
+            modulation_limit=adapter_modulation_limit,
+        )
 
         self.up3_2 = Upsample(int(dim * 4))
         self.reduce_chan_level2 = nn.Conv2d(int(dim * 4), int(dim * 2), 1, bias=bias)
@@ -626,14 +659,22 @@ class EcoDPLPromptIR(nn.Module):
             TransformerBlock(dim=int(dim * 2), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[1])
         ])
-        self.adapter_dec_level2 = SFTAdapter(in_channels=int(dim * 2), prompt_channels=self.latent_dim)
+        self.adapter_dec_level2 = SFTAdapter(
+            in_channels=int(dim * 2),
+            prompt_channels=self.latent_dim,
+            modulation_limit=adapter_modulation_limit,
+        )
 
         self.up2_1 = Upsample(int(dim * 2))
         self.decoder_level1 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[0])
         ])
-        self.adapter_dec_level1 = SFTAdapter(in_channels=int(dim * 2), prompt_channels=self.latent_dim)
+        self.adapter_dec_level1 = SFTAdapter(
+            in_channels=int(dim * 2),
+            prompt_channels=self.latent_dim,
+            modulation_limit=adapter_modulation_limit,
+        )
 
         self.refinement = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)

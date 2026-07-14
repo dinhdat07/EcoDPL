@@ -17,6 +17,15 @@ from utils.derain_release import (
 
 
 def load_compatible_state(model, state):
+    for name, value in state.items():
+        if (
+            torch.is_tensor(value)
+            and (value.is_floating_point() or value.is_complex())
+            and not torch.isfinite(value).all()
+        ):
+            raise FloatingPointError(
+                f"Checkpoint contains non-finite model tensor: {name}"
+            )
     result = model.load_state_dict(state, strict=False)
     allowed_missing_fragments = (
         "nsp_input_cov",
@@ -66,6 +75,7 @@ def main():
     parser.add_argument("--cuda", type=int, default=0)
     parser.add_argument("--num-prompts", type=int, default=100)
     parser.add_argument("--max-tasks", type=int, default=10)
+    parser.add_argument("--adapter-modulation-limit", type=float, default=1.0)
     parser.add_argument(
         "--task-id",
         type=int,
@@ -81,7 +91,9 @@ def main():
 
     device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
     model = EcoDPLPromptIR(
-        num_prompts=args.num_prompts, max_tasks=args.max_tasks
+        num_prompts=args.num_prompts,
+        max_tasks=args.max_tasks,
+        adapter_modulation_limit=args.adapter_modulation_limit,
     ).to(device)
     try:
         checkpoint = torch.load(args.checkpoint, map_location=device, weights_only=False)

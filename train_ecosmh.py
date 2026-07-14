@@ -184,6 +184,61 @@ def autocast_context(device, enabled):
     return torch.cuda.amp.autocast(enabled=enabled)
 
 
+def tensor_summary(tensor):
+    if tensor is None:
+        return None
+    detached = tensor.detach().float()
+    finite = torch.isfinite(detached)
+    summary = {
+        "shape": list(detached.shape),
+        "finite_fraction": float(finite.float().mean().item()),
+    }
+    if finite.any():
+        values = detached[finite]
+        summary.update(
+            min=float(values.min().item()),
+            max=float(values.max().item()),
+            mean=float(values.mean().item()),
+        )
+    return summary
+
+
+def write_numerical_diagnostic(
+    args, task, task_index, epoch, step, scaler, tensors, model
+):
+    first_bad_parameter = None
+    for name, parameter in model.named_parameters():
+        if not torch.isfinite(parameter.detach()).all():
+            first_bad_parameter = name
+            break
+    payload = {
+        "task": task,
+        "task_index": task_index,
+        "epoch": epoch,
+        "step": step,
+        "amp_scale": float(scaler.get_scale()) if scaler.is_enabled() else None,
+        "first_nonfinite_parameter": first_bad_parameter,
+        "tensors": {
+            name: tensor_summary(tensor) for name, tensor in tensors.items()
+        },
+    }
+    path = os.path.join(
+        args.output_dir,
+        f"nonfinite_{task}_epoch{epoch}_step{step}.json",
+    )
+    with open(path, "w") as handle:
+        json.dump(payload, handle, indent=2, sort_keys=True)
+    return path
+
+
+def first_nonfinite_optimizer_state(optimizer):
+    for parameter_index, state in enumerate(optimizer.state.values()):
+        for state_name, value in state.items():
+            if torch.is_tensor(value) and not torch.isfinite(value).all():
+                return f"parameter[{parameter_index}].{state_name}"
+    return None
+
+
 def load_compatible_state(model, state):
     result = model.load_state_dict(state, strict=False)
     # Allow statistical memory missing keys when loading from standard models
@@ -199,13 +254,23 @@ def load_compatible_state(model, state):
         print(f"Checkpoint mismatch warning. Missing: {missing}; unexpected: {unexpected}")
 
 
-def save_checkpoint(path, model, optimizer, scheduler, task_index, epoch, best_metric):
+def save_checkpoint(
+    path,
+    model,
+    optimizer,
+    scheduler,
+    scaler,
+    task_index,
+    epoch,
+    best_metric,
+):
     os.makedirs(os.path.dirname(path), exist_ok=True)
     torch.save(
         {
             "model": model.state_dict(),
             "optimizer": optimizer.state_dict(),
             "scheduler": scheduler.state_dict() if scheduler is not None else None,
+            "scaler": scaler.state_dict() if scaler is not None else None,
             "task_index": task_index,
             "epoch": epoch,
             "best_metric": best_metric,
@@ -220,6 +285,15 @@ def load_model_weights(path, model, device):
     except TypeError:
         checkpoint = torch.load(path, map_location=device)
     state = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    for name, value in state.items():
+        if (
+            torch.is_tensor(value)
+            and (value.is_floating_point() or value.is_complex())
+            and not torch.isfinite(value).all()
+        ):
+            raise FloatingPointError(
+                f"Checkpoint {path} contains non-finite model tensor: {name}"
+            )
     load_compatible_state(model, state)
     return checkpoint
 
@@ -281,6 +355,11 @@ def main():
     parser.add_argument("--initial-task-index", type=int, default=0)
     parser.add_argument("--resume-state", default=None)
     parser.add_argument(
+        "--resume-weights-only",
+        action="store_true",
+        help="Load model weights but reset optimizer, scheduler and epoch count.",
+    )
+    parser.add_argument(
         "--trainable-scope",
         choices=["all", "prompts", "prompts_adapters", "ppa_scope", "auto"],
         default="auto",
@@ -308,6 +387,9 @@ def main():
     parser.add_argument("--covariance-shrinkage", type=float, default=0.1)
     parser.add_argument("--nsp-threshold", type=float, default=0.03)
     parser.add_argument("--nsp-strength", type=float, default=1.0)
+    parser.add_argument("--adapter-modulation-limit", type=float, default=1.0)
+    parser.add_argument("--max-grad-norm", type=float, default=1.0)
+    parser.add_argument("--max-nonfinite-skips", type=int, default=3)
     parser.add_argument("--validation-fraction", type=float, default=0.1)
     
     parser.add_argument("--eval-every", type=int, default=5)
@@ -335,6 +417,12 @@ def main():
         parser.error("Task sequence exceeds --max-tasks")
     if not 0.0 < args.validation_fraction < 1.0:
         parser.error("--validation-fraction must be in (0, 1)")
+    if args.adapter_modulation_limit <= 0:
+        parser.error("--adapter-modulation-limit must be positive")
+    if args.max_grad_norm <= 0:
+        parser.error("--max-grad-norm must be positive")
+    if args.max_nonfinite_skips < 0:
+        parser.error("--max-nonfinite-skips cannot be negative")
     prompts_per_task = args.prompts_per_task
     if prompts_per_task is None:
         prompts_per_task = args.num_prompts // args.max_tasks
@@ -352,14 +440,25 @@ def main():
         max_tasks=args.max_tasks,
         router_temperature=args.router_temperature,
         covariance_shrinkage=args.covariance_shrinkage,
+        adapter_modulation_limit=args.adapter_modulation_limit,
     ).to(device)
     
+    resume_checkpoint = None
     if args.resume_state:
-        checkpoint = load_model_weights(args.resume_state, model, device)
+        resume_checkpoint = load_model_weights(args.resume_state, model, device)
         print(f"[checkpoint] resumed {args.resume_state}", flush=True)
         
     perceptual = None if args.no_perceptual else VGGPerceptualLoss().to(device)
     scaler = build_grad_scaler(device, args.amp)
+    if (
+        not args.resume_weights_only
+        and
+        scaler.is_enabled()
+        and
+        isinstance(resume_checkpoint, dict)
+        and resume_checkpoint.get("scaler") is not None
+    ):
+        scaler.load_state_dict(resume_checkpoint["scaler"])
     from null_space import (
         apply_null_space_projection,
         compute_null_space_projectors,
@@ -381,6 +480,7 @@ def main():
             args, task, task_index
         )
         best_metric = -1.0
+        start_epoch = 1
         block_start = task_index * prompts_per_task
         block_end = block_start + prompts_per_task
         model.set_active_prompt_range(block_start, block_end)
@@ -406,6 +506,39 @@ def main():
             T_max=max(1, args.scheduler_t_max or args.epochs_per_task),
             eta_min=args.lr * 0.01,
         )
+        if (
+            not args.resume_weights_only
+            and
+            local_task_index == 0
+            and isinstance(resume_checkpoint, dict)
+            and resume_checkpoint.get("task_index") == task_index
+            and resume_checkpoint.get("optimizer") is not None
+        ):
+            optimizer.load_state_dict(resume_checkpoint["optimizer"])
+            bad_optimizer_state = first_nonfinite_optimizer_state(optimizer)
+            if bad_optimizer_state is not None:
+                raise FloatingPointError(
+                    "Checkpoint contains non-finite optimizer state at "
+                    f"{bad_optimizer_state}. Use an earlier best checkpoint "
+                    "or --resume-weights-only."
+                )
+            if resume_checkpoint.get("scheduler") is not None:
+                scheduler.load_state_dict(resume_checkpoint["scheduler"])
+            start_epoch = int(resume_checkpoint.get("epoch", 0)) + 1
+            best_metric = float(resume_checkpoint.get("best_metric", -1.0))
+            global_epoch = (
+                task_index * args.epochs_per_task + start_epoch - 1
+            )
+            print(
+                f"[checkpoint] continuing task {task_index} at epoch "
+                f"{start_epoch}/{args.epochs_per_task}",
+                flush=True,
+            )
+        if start_epoch > args.epochs_per_task:
+            raise ValueError(
+                f"Checkpoint already reached epoch {start_epoch - 1}; "
+                f"--epochs-per-task is {args.epochs_per_task}"
+            )
 
         # Before training a new task, backup protected prompts
         model.backup_protected_prompts()
@@ -428,11 +561,12 @@ def main():
         else:
             P_null_dict = {}
 
-        for epoch in range(1, args.epochs_per_task + 1):
+        for epoch in range(start_epoch, args.epochs_per_task + 1):
             model.train()
             running_loss = 0.0
             steps_this_epoch = 0
             optimizer_steps = 0
+            nonfinite_skips = 0
             progress = tqdm(train_loader, desc=f"{task} epoch {epoch}/{args.epochs_per_task}", disable=args.no_progress)
             
             for step, (degraded, clean) in enumerate(progress, start=1):
@@ -447,17 +581,83 @@ def main():
                 with autocast_context(device, scaler.is_enabled()):
                     restored, aux = model(degraded, return_aux=True)
                     restored = crop_to_shape(restored, original_shape)
-                    loss = args.alpha * F.smooth_l1_loss(restored, clean)
-                    loss = loss + args.zeta * aux["image_distance"] + args.eta * aux["feature_distance"]
+                    reconstruction_loss = F.smooth_l1_loss(restored, clean)
+                    image_distance_loss = aux["image_distance"]
+                    feature_distance_loss = aux["feature_distance"]
+                    loss = args.alpha * reconstruction_loss
+                    loss = loss + args.zeta * image_distance_loss
+                    loss = loss + args.eta * feature_distance_loss
 
+                perceptual_loss = torch.zeros((), device=device)
                 if perceptual is not None and args.perceptual_weight > 0:
                     with autocast_context(device, False):
-                        loss = loss + args.perceptual_weight * perceptual(restored.float(), clean.float())
+                        perceptual_loss = perceptual(
+                            restored.float(), clean.float()
+                        )
+                        loss = loss + args.perceptual_weight * perceptual_loss
+
+                loss_tensors = {
+                    "degraded": degraded,
+                    "clean": clean,
+                    "restored": restored,
+                    "loss": loss,
+                    "reconstruction_loss": reconstruction_loss,
+                    "image_distance_loss": image_distance_loss,
+                    "feature_distance_loss": feature_distance_loss,
+                    "perceptual_loss": perceptual_loss,
+                    "image_logits": aux["image_logits"],
+                    "feature_logits": aux["feature_logits"],
+                }
+                if not torch.isfinite(loss):
+                    diagnostic_path = write_numerical_diagnostic(
+                        args,
+                        task,
+                        task_index,
+                        epoch,
+                        step,
+                        scaler,
+                        loss_tensors,
+                        model,
+                    )
+                    raise FloatingPointError(
+                        "Non-finite forward loss. Training stopped before "
+                        f"backward; diagnostics: {diagnostic_path}"
+                    )
 
                 if scaler.is_enabled():
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        trainable_parameters, args.max_grad_norm
+                    )
+                    if not torch.isfinite(grad_norm):
+                        reduced_scale = max(float(scaler.get_scale()) / 2.0, 1.0)
+                        optimizer.zero_grad(set_to_none=True)
+                        scaler.update(new_scale=reduced_scale)
+                        nonfinite_skips += 1
+                        progress.set_postfix(
+                            loss=f"{loss.item():.4f}",
+                            skipped_nonfinite=nonfinite_skips,
+                        )
+                        if nonfinite_skips > args.max_nonfinite_skips:
+                            diagnostic_path = write_numerical_diagnostic(
+                                args,
+                                task,
+                                task_index,
+                                epoch,
+                                step,
+                                scaler,
+                                {
+                                    **loss_tensors,
+                                    "gradient_norm": grad_norm,
+                                },
+                                model,
+                            )
+                            raise FloatingPointError(
+                                "Repeated non-finite AMP gradients; "
+                                f"diagnostics: {diagnostic_path}"
+                            )
+                        continue
                     
                     # Frozen prompt slices must not receive optimizer updates.
                     model.zero_protected_prompt_grads()
@@ -476,7 +676,27 @@ def main():
                     optimizer_steps += 1
                 else:
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(
+                        trainable_parameters, args.max_grad_norm
+                    )
+                    if not torch.isfinite(grad_norm):
+                        diagnostic_path = write_numerical_diagnostic(
+                            args,
+                            task,
+                            task_index,
+                            epoch,
+                            step,
+                            scaler,
+                            {
+                                **loss_tensors,
+                                "gradient_norm": grad_norm,
+                            },
+                            model,
+                        )
+                        raise FloatingPointError(
+                            "Non-finite gradients without AMP; "
+                            f"diagnostics: {diagnostic_path}"
+                        )
                     
                     # Frozen prompt slices must not receive optimizer updates.
                     model.zero_protected_prompt_grads()
@@ -536,6 +756,7 @@ def main():
                         model,
                         optimizer,
                         scheduler,
+                        scaler,
                         task_index,
                         epoch,
                         best_metric,
@@ -548,6 +769,7 @@ def main():
                     model,
                     optimizer,
                     scheduler,
+                    scaler,
                     task_index,
                     epoch,
                     best_metric,
@@ -567,6 +789,7 @@ def main():
             model,
             optimizer,
             scheduler,
+            scaler,
             task_index,
             args.epochs_per_task,
             best_metric,
