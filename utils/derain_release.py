@@ -68,6 +68,16 @@ class H5DerainDataset(Dataset):
         clean = np.asarray(self._target_h5[key], dtype=np.float32)
 
         _, h, w = degraded.shape
+        if self.patch_size and (h < self.patch_size or w < self.patch_size):
+            pad_h = max(0, self.patch_size - h)
+            pad_w = max(0, self.patch_size - w)
+            degraded = np.pad(
+                degraded, ((0, 0), (0, pad_h), (0, pad_w)), mode="reflect"
+            )
+            clean = np.pad(
+                clean, ((0, 0), (0, pad_h), (0, pad_w)), mode="reflect"
+            )
+            _, h, w = degraded.shape
         if self.patch_size and (h > self.patch_size or w > self.patch_size):
             if self.augment:
                 top = random.randint(0, h - self.patch_size)
@@ -146,11 +156,14 @@ def tensor_to_rgb(output, shape=None):
 
 
 @torch.no_grad()
-def tiled_forward(model, image, tile_size=384, overlap=32, multiple=8):
+def tiled_forward(
+    model, image, tile_size=384, overlap=32, multiple=8, forward_kwargs=None
+):
+    forward_kwargs = {} if forward_kwargs is None else dict(forward_kwargs)
     _, _, h, w = image.shape
     if tile_size is None or tile_size <= 0 or (h <= tile_size and w <= tile_size):
         padded, original_shape = pad_to_multiple(image, multiple=multiple)
-        return model(padded)[..., :original_shape[0], :original_shape[1]]
+        return model(padded, **forward_kwargs)[..., :original_shape[0], :original_shape[1]]
 
     stride = max(1, tile_size - overlap)
     ys = list(range(0, max(h - tile_size, 0) + 1, stride))
@@ -166,7 +179,7 @@ def tiled_forward(model, image, tile_size=384, overlap=32, multiple=8):
         for left in xs:
             patch = image[..., top:top + tile_size, left:left + tile_size]
             padded, patch_shape = pad_to_multiple(patch, multiple=multiple)
-            restored = model(padded)[..., :patch_shape[0], :patch_shape[1]]
+            restored = model(padded, **forward_kwargs)[..., :patch_shape[0], :patch_shape[1]]
             output[..., top:top + patch_shape[0], left:left + patch_shape[1]] += restored
             weight[..., top:top + patch_shape[0], left:left + patch_shape[1]] += 1.0
     return output / weight.clamp_min(1.0)

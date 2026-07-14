@@ -1,134 +1,129 @@
 import torch
-import torch.nn.functional as F
+
 
 @torch.no_grad()
-def compute_null_space_projectors(model, patch_size, threshold=0.03):
-    """
-    Compute Null Space projectors for all SFTAdapters to prevent Catastrophic Forgetting.
-    """
-    P_null_dict = {}
-    
-    # Get protected prompts
-    img_fuser = model.image_fuser
-    feat_fuser = model.feature_fuser
-    
-    if not img_fuser.protected_mask.any():
-        return P_null_dict # No protected prompts yet
-        
-    img_protected_vals = img_fuser.values[img_fuser.protected_mask] # [K, 3, 32, 32]
-    feat_protected_vals = feat_fuser.values[feat_fuser.protected_mask] # [K, latent_dim, 1, 1]
-    
-    # Helper to compute P_null for a Conv2d layer
-    def compute_P_null_for_tensor(tensor, conv):
-        # Extract patches
-        # tensor is [K, C, H, W]
-        # unfold to [K, C * 9, L]
-        unfolded = F.unfold(tensor, kernel_size=conv.kernel_size, padding=conv.padding, stride=conv.stride)
-        # Reshape to [K * L, C * 9]
-        X = unfolded.transpose(1, 2).reshape(-1, unfolded.shape[1])
-        
-        # Compute uncentered covariance
-        # To avoid memory issues with large K*L, we compute X.T @ X
-        cov = (X.T @ X) / X.shape[0]
-        
-        # SVD
-        U, S, V = torch.linalg.svd(cov, full_matrices=True)
-        
-        # Find Null Space
-        zero_idx = S <= S[0] * threshold
-        if not zero_idx.any():
-            # If no null space, return identity
-            return torch.eye(X.shape[1], device=X.device)
-            
-        U_null = U[:, zero_idx]
-        P_null = U_null @ U_null.T
-        return P_null
+def projector_from_covariance(covariance, count, threshold=0.03, strength=1.0):
+    """Build a right projector onto low-energy directions of old inputs.
 
-    def get_P_nulls(adapter, prompts, spatial_size):
-        # prompts: [K, C, H_p, W_p]
-        # Interpolate to the spatial size the adapter sees during training
-        if prompts.shape[-2:] != (spatial_size, spatial_size):
-            prompts = F.interpolate(prompts, size=(spatial_size, spatial_size), mode="bilinear", align_corners=False)
-            
-        # P_null for first layer
-        conv0 = adapter.conv_gamma[0]
-        P_null_0 = compute_P_null_for_tensor(prompts, conv0)
-        
-        # Compute activation for second layer
-        with torch.no_grad():
-            H_gamma = adapter.conv_gamma[0](prompts)
-            H_gamma = adapter.conv_gamma[1](H_gamma) # LeakyReLU
-            
-            H_beta = adapter.conv_beta[0](prompts)
-            H_beta = adapter.conv_beta[1](H_beta) # LeakyReLU
-            
-        conv2_gamma = adapter.conv_gamma[2]
-        P_null_gamma_2 = compute_P_null_for_tensor(H_gamma, conv2_gamma)
-        
-        conv2_beta = adapter.conv_beta[2]
-        P_null_beta_2 = compute_P_null_for_tensor(H_beta, conv2_beta)
-        
-        return {
-            "gamma_0": P_null_0,
-            "beta_0": P_null_0, # Beta and Gamma 0 have the same input
-            "gamma_2": P_null_gamma_2,
-            "beta_2": P_null_beta_2,
-        }
+    A strength of one is a hard approximate null-space constraint. Smaller
+    values interpolate with the identity and intentionally trade stability for
+    plasticity. If old inputs span the full space, the hard projector is zero.
+    """
+    if not 0.0 <= threshold < 1.0:
+        raise ValueError("threshold must be in [0, 1)")
+    if not 0.0 <= strength <= 1.0:
+        raise ValueError("strength must be in [0, 1]")
+    if int(count) <= 0:
+        raise ValueError("Cannot build a projector before collecting activations")
 
-    # Map adapters to their spatial sizes (assuming input patch_size)
-    sizes = {
-        "image_prompt_adapter": patch_size,
-        "adapter_enc_level1": patch_size,
-        "adapter_enc_level2": patch_size // 2,
-        "adapter_enc_level3": patch_size // 4,
-        "feature_prompt_adapter": patch_size // 8,
-        "adapter_dec_level3": patch_size // 4,
-        "adapter_dec_level2": patch_size // 2,
-        "adapter_dec_level1": patch_size,
+    covariance = covariance.float() / float(count)
+    covariance = 0.5 * (covariance + covariance.t())
+    eigenvalues, eigenvectors = torch.linalg.eigh(covariance)
+    largest = eigenvalues[-1].clamp_min(0.0)
+    identity = torch.eye(
+        covariance.shape[0], device=covariance.device, dtype=covariance.dtype
+    )
+    if largest <= torch.finfo(covariance.dtype).eps:
+        null_projector = identity
+        nullity = covariance.shape[0]
+    else:
+        low_energy = eigenvalues <= largest * threshold
+        basis = eigenvectors[:, low_energy]
+        null_projector = basis @ basis.t()
+        nullity = int(low_energy.sum().item())
+    projector = strength * null_projector + (1.0 - strength) * identity
+    return projector, {
+        "dimension": covariance.shape[0],
+        "nullity": nullity,
+        "largest_eigenvalue": float(largest.item()),
     }
-    
-    for name, adapter in model.named_modules():
-        if name in sizes:
-            # feature_prompt_adapter and decoder adapters use feature_prompt
-            if "dec" in name or "feature" in name:
-                prompts = feat_protected_vals
-            else:
-                prompts = img_protected_vals
-                
-            P_null_dict[name] = get_P_nulls(adapter, prompts, sizes[name])
-            
-    return P_null_dict
 
-def apply_null_space_projection(model, P_null_dict, old_weights):
-    """
-    Project the actual weight update (Delta W) into the Null Space.
-    This guarantees mathematically that AdamW's element-wise scaling 
-    does not violate the Null Space constraints.
+
+@torch.no_grad()
+def compute_null_space_projectors(
+    model, patch_size=None, threshold=0.03, strength=1.0
+):
+    """Build adapter projectors from cumulative observed activation covariance."""
+    del patch_size  # Compatibility with older training commands.
+    projectors = {}
+    for name, adapter in model.named_modules():
+        required = (
+            "nsp_input_cov",
+            "nsp_gamma_hidden_cov",
+            "nsp_beta_hidden_cov",
+        )
+        if not all(hasattr(adapter, attr) for attr in required):
+            continue
+        if int(adapter.nsp_input_count.item()) == 0:
+            continue
+
+        input_projector, input_stats = projector_from_covariance(
+            adapter.nsp_input_cov,
+            adapter.nsp_input_count,
+            threshold=threshold,
+            strength=strength,
+        )
+        gamma_projector, gamma_stats = projector_from_covariance(
+            adapter.nsp_gamma_hidden_cov,
+            adapter.nsp_gamma_hidden_count,
+            threshold=threshold,
+            strength=strength,
+        )
+        beta_projector, beta_stats = projector_from_covariance(
+            adapter.nsp_beta_hidden_cov,
+            adapter.nsp_beta_hidden_count,
+            threshold=threshold,
+            strength=strength,
+        )
+        projectors[name] = {
+            "gamma_0": input_projector,
+            "beta_0": input_projector,
+            "gamma_2": gamma_projector,
+            "beta_2": beta_projector,
+            "stats": {
+                "input": input_stats,
+                "gamma_hidden": gamma_stats,
+                "beta_hidden": beta_stats,
+            },
+        }
+    return projectors
+
+
+@torch.no_grad()
+def snapshot_projected_weights(model, projectors):
+    """Clone only weights constrained after the optimizer step."""
+    prefixes = tuple(f"{name}.conv_" for name in projectors)
+    return {
+        name: parameter.detach().clone()
+        for name, parameter in model.named_parameters()
+        if prefixes and name.startswith(prefixes) and name.endswith(".weight")
+    }
+
+
+@torch.no_grad()
+def apply_null_space_projection(model, projectors, old_weights):
+    """Project the actual AdamW candidate update on old activation null spaces.
+
+    This preserves each constrained linear map on sampled old activations up to
+    the chosen eigenvalue threshold. It is not a whole-network zero-forgetting
+    guarantee.
     """
     for name, adapter in model.named_modules():
-        if name in P_null_dict:
-            P_nulls = P_null_dict[name]
-            for branch_name in ["gamma", "beta"]:
-                branch = getattr(adapter, f"conv_{branch_name}")
-                
-                # Layer 0
-                conv0 = branch[0]
-                full_name_0 = f"{name}.conv_{branch_name}.0.weight"
-                if full_name_0 in old_weights:
-                    old_w = old_weights[full_name_0]
-                    delta = conv0.weight.data - old_w
-                    shape = delta.shape
-                    delta_flat = delta.view(shape[0], -1)
-                    delta_proj = delta_flat @ P_nulls[f"{branch_name}_0"]
-                    conv0.weight.data.copy_(old_w + delta_proj.view(shape))
-                    
-                # Layer 2
-                conv2 = branch[2]
-                full_name_2 = f"{name}.conv_{branch_name}.2.weight"
-                if full_name_2 in old_weights:
-                    old_w = old_weights[full_name_2]
-                    delta = conv2.weight.data - old_w
-                    shape = delta.shape
-                    delta_flat = delta.view(shape[0], -1)
-                    delta_proj = delta_flat @ P_nulls[f"{branch_name}_2"]
-                    conv2.weight.data.copy_(old_w + delta_proj.view(shape))
+        if name not in projectors:
+            continue
+        module_projectors = projectors[name]
+        for branch_name in ("gamma", "beta"):
+            branch = getattr(adapter, f"conv_{branch_name}")
+            for layer_index in (0, 2):
+                full_name = f"{name}.conv_{branch_name}.{layer_index}.weight"
+                if full_name not in old_weights:
+                    continue
+                weight = branch[layer_index].weight
+                old_weight = old_weights[full_name]
+                delta = weight.data - old_weight
+                shape = delta.shape
+                projector = module_projectors[f"{branch_name}_{layer_index}"]
+                projected = delta.reshape(shape[0], -1).float() @ projector
+                weight.data.copy_(
+                    old_weight + projected.to(weight.dtype).reshape(shape)
+                )

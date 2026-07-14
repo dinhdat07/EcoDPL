@@ -2,11 +2,10 @@ import argparse
 import csv
 import json
 import os
-from copy import deepcopy
 
 import torch
 import torch.nn.functional as F
-from torch.utils.data import DataLoader
+from torch.utils.data import DataLoader, Subset
 from torchvision.models import VGG16_Weights, vgg16
 from tqdm import tqdm
 
@@ -39,102 +38,112 @@ class VGGPerceptualLoss(torch.nn.Module):
         return F.mse_loss(self.features(pred), self.features(target))
 
 
-class ParameterRegularizer:
-    def __init__(self, device, normalize_importance=True, mode="l1", importance_floor=0.0):
-        self.device = device
-        self.normalize_importance = normalize_importance
-        self.mode = mode
-        self.importance_floor = importance_floor
-        self.star = None
-        self.importance = None
-
-    def penalty(self, model):
-        if self.star is None or self.importance is None:
-            return torch.tensor(0.0, device=self.device)
-        total = torch.tensor(0.0, device=self.device)
-        count = 0
-        for param, star, importance in zip(model.parameters(), self.star, self.importance):
-            if not param.requires_grad:
-                continue
-            importance = importance.to(param.device)
-            if self.normalize_importance:
-                importance = importance / importance.detach().mean().clamp_min(1e-12)
-            if self.importance_floor > 0:
-                importance = importance + self.importance_floor
-            diff = param - star.to(param.device)
-            if self.mode == "l2":
-                total = total + torch.mean(importance * diff.square())
-            else:
-                total = total + torch.mean(importance * diff.abs())
-            count += 1
-        return total / max(count, 1)
-
-    @torch.no_grad()
-    def consolidate(self, model, loader, max_batches=50, pad_multiple=8, microbatch_size=4, use_amp=False, no_progress=False):
-        model.train()
-        importance = [torch.zeros_like(param, device=self.device) for param in model.parameters()]
-        seen = 0
-        for degraded, clean in tqdm(loader, total=min(len(loader), max_batches), desc="importance", leave=False, disable=no_progress):
-            degraded = degraded.to(self.device, non_blocking=True)
-            clean = clean.to(self.device, non_blocking=True)
-            model.zero_grad(set_to_none=True)
-            with torch.enable_grad():
-                if microbatch_size is None or microbatch_size <= 0:
-                    microbatch_size = degraded.shape[0]
-                degraded_chunks = degraded.split(microbatch_size)
-                clean_chunks = clean.split(microbatch_size)
-                chunk_count = len(degraded_chunks)
-                for degraded_chunk, clean_chunk in zip(degraded_chunks, clean_chunks):
-                    original_shape = degraded_chunk.shape[-2:]
-                    if pad_multiple and pad_multiple > 1:
-                        degraded_chunk, _ = pad_to_multiple(degraded_chunk, multiple=pad_multiple)
-                    with autocast_context(self.device, use_amp):
-                        restored = model(degraded_chunk)
-                        restored = crop_to_shape(restored, original_shape)
-                        loss = F.smooth_l1_loss(restored, clean_chunk) / chunk_count
-                    loss.backward()
-            for slot, param in zip(importance, model.parameters()):
-                if param.grad is not None:
-                    slot.add_(param.grad.detach().abs())
-            seen += 1
-            if seen >= max_batches:
-                break
-        if seen > 0:
-            importance = [slot / seen for slot in importance]
-        self.importance = importance
-        self.star = [param.detach().clone() for param in model.parameters()]
-        model.zero_grad(set_to_none=True)
+def _split_indices(length, validation_fraction, seed):
+    if length < 2:
+        raise ValueError("At least two training samples are required for validation")
+    validation_size = min(
+        length - 1, max(1, int(round(length * validation_fraction)))
+    )
+    order = torch.randperm(length, generator=torch.Generator().manual_seed(seed)).tolist()
+    return order[validation_size:], order[:validation_size]
 
 
-def build_train_loader(args, task, batch_size=None):
-    train_set = H5DerainDataset(args.data_root, task, patch_size=args.patch_size, augment=True)
-    return DataLoader(
-        train_set,
-        batch_size=batch_size or args.batch_size,
+def build_loaders(args, task, task_index):
+    train_set = H5DerainDataset(
+        args.data_root, task, patch_size=args.patch_size, augment=True
+    )
+    deterministic_set = H5DerainDataset(
+        args.data_root, task, patch_size=args.patch_size, augment=False
+    )
+    split_seed = args.seed + task_index * 1009
+    train_indices, validation_indices = _split_indices(
+        len(train_set), args.validation_fraction, split_seed
+    )
+    train_loader = DataLoader(
+        Subset(train_set, train_indices),
+        batch_size=args.batch_size,
         shuffle=True,
         num_workers=args.num_workers,
         pin_memory=True,
-        drop_last=True,
+        drop_last=False,
         persistent_workers=args.num_workers > 0,
     )
-
-
-def build_loaders(args, task):
-    train_loader = build_train_loader(args, task)
-    eval_set = ImagePairDataset(args.data_root, task)
-    eval_loader = DataLoader(eval_set, batch_size=1, shuffle=False, num_workers=0)
-    return train_loader, eval_loader
+    validation_loader = DataLoader(
+        Subset(deterministic_set, validation_indices),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    statistics_loader = DataLoader(
+        Subset(deterministic_set, train_indices),
+        batch_size=args.batch_size,
+        shuffle=False,
+        num_workers=args.num_workers,
+        pin_memory=True,
+        persistent_workers=args.num_workers > 0,
+    )
+    return train_loader, validation_loader, statistics_loader
 
 
 @torch.no_grad()
-def evaluate(model, loader, device, limit=None, tile_size=384, tile_overlap=32, no_progress=False):
+def evaluate_validation(model, loader, device, task_id, limit=None, no_progress=False):
+    was_training = model.training
+    model.eval()
+    psnr_values = []
+    for index, (degraded, clean) in enumerate(
+        tqdm(loader, desc="validation", leave=False, disable=no_progress)
+    ):
+        degraded = degraded.to(device, non_blocking=True)
+        clean = clean.to(device, non_blocking=True)
+        original_shape = degraded.shape[-2:]
+        degraded, _ = pad_to_multiple(degraded, multiple=8)
+        restored = crop_to_shape(model(degraded, task_id=task_id), original_shape)
+        mse = (restored.clamp(0, 1) - clean).square().flatten(1).mean(1)
+        psnr_values.extend((-10.0 * torch.log10(mse.clamp_min(1e-12))).tolist())
+        if limit is not None and index + 1 >= limit:
+            break
+    model.train(was_training)
+    return sum(psnr_values) / len(psnr_values)
+
+
+@torch.no_grad()
+def evaluate_test(
+    model,
+    loader,
+    device,
+    task_id=None,
+    expected_task_id=None,
+    limit=None,
+    tile_size=384,
+    tile_overlap=32,
+    no_progress=False,
+):
     was_training = model.training
     model.eval()
     psnr_values = []
     ssim_values = []
+    route_hits = []
     for index, (_, degraded, clean_np) in enumerate(tqdm(loader, desc="eval", leave=False, disable=no_progress)):
         degraded = degraded.to(device, non_blocking=True)
-        restored = tiled_forward(model, degraded, tile_size=tile_size, overlap=tile_overlap, multiple=8)
+        if task_id is None:
+            routing_probs = model.route_task_probs(degraded)
+            forward_kwargs = {"routing_probs": routing_probs}
+            if routing_probs is not None and expected_task_id is not None:
+                route_hits.extend(
+                    (routing_probs.argmax(dim=1) == expected_task_id).float().tolist()
+                )
+        else:
+            forward_kwargs = {"task_id": task_id}
+        restored = tiled_forward(
+            model,
+            degraded,
+            tile_size=tile_size,
+            overlap=tile_overlap,
+            multiple=8,
+            forward_kwargs=forward_kwargs,
+        )
         restored_np = tensor_to_rgb(restored)
         clean = clean_np.numpy()[0]
         psnr_values.append(calculate_psnr(restored_np, clean))
@@ -143,7 +152,14 @@ def evaluate(model, loader, device, limit=None, tile_size=384, tile_overlap=32, 
             break
     if was_training:
         model.train()
-    return sum(psnr_values) / len(psnr_values), sum(ssim_values) / len(ssim_values)
+    route_accuracy = (
+        sum(route_hits) / len(route_hits) if route_hits else float("nan")
+    )
+    return (
+        sum(psnr_values) / len(psnr_values),
+        sum(ssim_values) / len(ssim_values),
+        route_accuracy,
+    )
 
 
 def crop_to_shape(tensor, shape):
@@ -216,6 +232,8 @@ def configure_trainable_parameters(model, scope, task_index):
         print(f"Scope is 'all' - Training full network for task {task_index}.")
         for param in model.parameters():
             param.requires_grad = True
+        for param in model.frozen_extractor.parameters():
+            param.requires_grad = False
         return
 
     trainable_markers = {
@@ -264,7 +282,7 @@ def main():
     parser.add_argument("--resume-state", default=None)
     parser.add_argument(
         "--trainable-scope",
-        choices=["all", "prompts", "prompts_adapters", "decoder_prompts", "auto"],
+        choices=["all", "prompts", "prompts_adapters", "ppa_scope", "auto"],
         default="auto",
     )
 
@@ -284,6 +302,13 @@ def main():
     parser.add_argument("--eta", type=float, default=1e-5)
     
     parser.add_argument("--num-prompts", type=int, default=100)
+    parser.add_argument("--max-tasks", type=int, default=10)
+    parser.add_argument("--prompts-per-task", type=int, default=None)
+    parser.add_argument("--router-temperature", type=float, default=1.0)
+    parser.add_argument("--covariance-shrinkage", type=float, default=0.1)
+    parser.add_argument("--nsp-threshold", type=float, default=0.03)
+    parser.add_argument("--nsp-strength", type=float, default=1.0)
+    parser.add_argument("--validation-fraction", type=float, default=0.1)
     
     parser.add_argument("--eval-every", type=int, default=5)
     parser.add_argument("--eval-limit", type=int, default=None)
@@ -303,12 +328,31 @@ def main():
     parser.add_argument("--no-perceptual", action="store_true")
     parser.add_argument("--amp", action="store_true")
     parser.add_argument("--no-progress", action="store_true")
+    parser.add_argument("--skip-continual-eval", action="store_true")
     args = parser.parse_args()
+
+    if args.initial_task_index + len(args.tasks) > args.max_tasks:
+        parser.error("Task sequence exceeds --max-tasks")
+    if not 0.0 < args.validation_fraction < 1.0:
+        parser.error("--validation-fraction must be in (0, 1)")
+    prompts_per_task = args.prompts_per_task
+    if prompts_per_task is None:
+        prompts_per_task = args.num_prompts // args.max_tasks
+    if prompts_per_task <= 0:
+        parser.error("--prompts-per-task must be positive")
+    if (args.initial_task_index + len(args.tasks)) * prompts_per_task > args.num_prompts:
+        parser.error("Private prompt blocks exceed --num-prompts capacity")
+    args.prompts_per_task = prompts_per_task
 
     set_seed(args.seed)
     device = torch.device(f"cuda:{args.cuda}" if torch.cuda.is_available() else "cpu")
     
-    model = EcoDPLPromptIR(num_prompts=args.num_prompts).to(device)
+    model = EcoDPLPromptIR(
+        num_prompts=args.num_prompts,
+        max_tasks=args.max_tasks,
+        router_temperature=args.router_temperature,
+        covariance_shrinkage=args.covariance_shrinkage,
+    ).to(device)
     
     if args.resume_state:
         checkpoint = load_model_weights(args.resume_state, model, device)
@@ -316,9 +360,16 @@ def main():
         
     perceptual = None if args.no_perceptual else VGGPerceptualLoss().to(device)
     scaler = build_grad_scaler(device, args.amp)
-    from null_space import compute_null_space_projectors, apply_null_space_projection
+    from null_space import (
+        apply_null_space_projection,
+        compute_null_space_projectors,
+        snapshot_projected_weights,
+    )
 
     metrics_path = os.path.join(args.output_dir, "metrics.csv")
+    continual_metrics_path = os.path.join(
+        args.output_dir, "continual_test_metrics.csv"
+    )
     os.makedirs(args.output_dir, exist_ok=True)
     with open(os.path.join(args.output_dir, "args.json"), "w") as handle:
         json.dump(vars(args), handle, indent=2, sort_keys=True)
@@ -326,15 +377,17 @@ def main():
 
     for local_task_index, task in enumerate(args.tasks):
         task_index = args.initial_task_index + local_task_index
-        train_loader, eval_loader = build_loaders(args, task)
+        train_loader, validation_loader, statistics_loader = build_loaders(
+            args, task, task_index
+        )
         best_metric = -1.0
-        # --- Allocate active prompts progressively ---
-        total_tasks = 5 # EcoDPL has 5 tasks usually
-        prompts_per_task = args.num_prompts // total_tasks
-        # Cap the max prompts to num_prompts
-        current_active_end = min(args.num_prompts, (task_index + 1) * prompts_per_task)
-        model.set_active_prompt_range(0, current_active_end)
-        print(f"[Prompts] Activated range 0 to {current_active_end} for task {task_index}", flush=True)
+        block_start = task_index * prompts_per_task
+        block_end = block_start + prompts_per_task
+        model.set_active_prompt_range(block_start, block_end)
+        print(
+            f"[Prompts] Private range {block_start}:{block_end} for task {task_index}",
+            flush=True,
+        )
 
         # --- Task-specific optimizer and trainable parameters ---
         current_scope = args.trainable_scope
@@ -350,7 +403,7 @@ def main():
         # CosineAnnealing per task
         scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
             optimizer,
-            T_max=max(1, args.epochs_per_task),
+            T_max=max(1, args.scheduler_t_max or args.epochs_per_task),
             eta_min=args.lr * 0.01,
         )
 
@@ -359,8 +412,19 @@ def main():
         
         # Compute Null Space projectors for SFTAdapters
         if task_index > 0:
-            P_null_dict = compute_null_space_projectors(model, args.patch_size)
-            print(f"[NSP] Computed {len(P_null_dict)} projectors.")
+            P_null_dict = compute_null_space_projectors(
+                model,
+                threshold=args.nsp_threshold,
+                strength=args.nsp_strength,
+            )
+            nullities = {
+                name: values["stats"]["input"]["nullity"]
+                for name, values in P_null_dict.items()
+            }
+            print(
+                f"[NSP] Computed {len(P_null_dict)} adapter projectors; "
+                f"input nullities={nullities}."
+            )
         else:
             P_null_dict = {}
 
@@ -395,17 +459,18 @@ def main():
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     
-                    # Prevent AdamW momentum explosion for frozen protected prompts
-                    if task_index > 0:
-                        model.zero_protected_prompt_grads()
+                    # Frozen prompt slices must not receive optimizer updates.
+                    model.zero_protected_prompt_grads()
                     
-                    if task_index > 0:
-                        old_weights = {name: p.data.clone() for name, p in model.named_parameters() if p.requires_grad}
+                    if P_null_dict:
+                        old_weights = snapshot_projected_weights(
+                            model, P_null_dict
+                        )
                         
                     scaler.step(optimizer)
                     scaler.update()
                     
-                    if task_index > 0:
+                    if P_null_dict:
                         apply_null_space_projection(model, P_null_dict, old_weights)
                         
                     optimizer_steps += 1
@@ -413,16 +478,17 @@ def main():
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                     
-                    # Prevent AdamW momentum explosion for frozen protected prompts
-                    if task_index > 0:
-                        model.zero_protected_prompt_grads()
+                    # Frozen prompt slices must not receive optimizer updates.
+                    model.zero_protected_prompt_grads()
                     
-                    if task_index > 0:
-                        old_weights = {name: p.data.clone() for name, p in model.named_parameters() if p.requires_grad}
+                    if P_null_dict:
+                        old_weights = snapshot_projected_weights(
+                            model, P_null_dict
+                        )
                         
                     optimizer.step()
                     
-                    if task_index > 0:
+                    if P_null_dict:
                         apply_null_space_projection(model, P_null_dict, old_weights)
                         
                     optimizer_steps += 1
@@ -448,24 +514,21 @@ def main():
                 "global_epoch": global_epoch,
                 "train_loss": running_loss / max(1, steps_this_epoch),
                 "lr": optimizer.param_groups[0]["lr"],
-                "psnr": "",
-                "ssim": "",
+                "validation_psnr": "",
             }
 
             should_eval = epoch == 1 or epoch % args.eval_every == 0 or epoch == args.epochs_per_task
             if should_eval:
-                psnr, ssim = evaluate(
+                validation_psnr = evaluate_validation(
                     model,
-                    eval_loader,
+                    validation_loader,
                     device,
+                    task_id=task_index,
                     limit=args.eval_limit,
-                    tile_size=args.tile_size,
-                    tile_overlap=args.tile_overlap,
                     no_progress=args.no_progress,
                 )
-                row["psnr"] = f"{psnr:.4f}"
-                row["ssim"] = f"{ssim:.4f}"
-                metric = psnr
+                row["validation_psnr"] = f"{validation_psnr:.4f}"
+                metric = validation_psnr
                 if metric > best_metric:
                     best_metric = metric
                     save_checkpoint(
@@ -497,7 +560,7 @@ def main():
             print(f"[checkpoint] restored {best_path} before SMH update", flush=True)
 
         print(f"[SMH] Updating Statistical Memory for task {task_index}...", flush=True)
-        model.update_task_statistics(task_index, train_loader, device)
+        model.update_task_statistics(task_index, statistics_loader, device)
 
         save_checkpoint(
             os.path.join(args.output_dir, f"after_{task}.pth"),
@@ -508,6 +571,44 @@ def main():
             args.epochs_per_task,
             best_metric,
         )
+
+        if not args.skip_continual_eval:
+            for seen_offset, seen_task in enumerate(args.tasks[: local_task_index + 1]):
+                seen_task_id = args.initial_task_index + seen_offset
+                test_loader = DataLoader(
+                    ImagePairDataset(args.data_root, seen_task),
+                    batch_size=1,
+                    shuffle=False,
+                    num_workers=0,
+                )
+                for mode in ("oracle", "routed"):
+                    oracle_task_id = seen_task_id if mode == "oracle" else None
+                    psnr, ssim, route_accuracy = evaluate_test(
+                        model,
+                        test_loader,
+                        device,
+                        task_id=oracle_task_id,
+                        expected_task_id=seen_task_id,
+                        limit=args.eval_limit,
+                        tile_size=args.tile_size,
+                        tile_overlap=args.tile_overlap,
+                        no_progress=args.no_progress,
+                    )
+                    append_metric(
+                        continual_metrics_path,
+                        {
+                            "after_task": task,
+                            "after_task_index": task_index,
+                            "eval_task": seen_task,
+                            "eval_task_index": seen_task_id,
+                            "mode": mode,
+                            "psnr": f"{psnr:.4f}",
+                            "ssim": f"{ssim:.4f}",
+                            "router_accuracy": (
+                                "" if mode == "oracle" else f"{route_accuracy:.4f}"
+                            ),
+                        },
+                    )
 
 
 if __name__ == "__main__":

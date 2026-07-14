@@ -44,7 +44,7 @@ def haar_dwt2d(x):
 
 
 def extract_degradation_features(x):
-    """Extract degradation-only features by discarding LL (content) sub-band.
+    """Extract a high-frequency degradation proxy by discarding the LL band.
 
     Uses the LH, HL, HH sub-bands which capture directional high-frequency
     information (horizontal, vertical, diagonal rain streaks).
@@ -53,40 +53,70 @@ def extract_degradation_features(x):
         x: Rainy image tensor [B, 3, H, W], values in [0, 1].
 
     Returns:
-        Tensor of shape [B, 3, H//2, W//2] containing degradation info only.
+        Tensor of shape [B, 3, H//2, W//2]. High-frequency scene texture is
+        still present, so this representation is not content-free.
     """
     _, lh, hl, hh = haar_dwt2d(x)
     # Combine high-freq sub-bands: average across input channels, stack as 3ch
     # Each sub-band captures a different direction of rain streaks
     return torch.cat([
-        lh.mean(dim=1, keepdim=True),  # Horizontal edges (rain direction)
-        hl.mean(dim=1, keepdim=True),  # Vertical edges (rain direction)
-        hh.mean(dim=1, keepdim=True),  # Diagonal edges
+        lh.abs().mean(dim=1, keepdim=True),
+        hl.abs().mean(dim=1, keepdim=True),
+        hh.abs().mean(dim=1, keepdim=True),
     ], dim=1)
 
 
 # ---------------------------------------------------------------------------
-# Fix #3: GMM Statistical Memory (K components + L2-Norm + Relative Distance)
+# GMM statistical memory (K components + consistent L2 normalization)
 # ---------------------------------------------------------------------------
 
-class GMMStatisticalMemory(nn.Module):
-    """Gaussian Mixture Model memory for task-free degradation routing.
 
-    Stores K Gaussian components per task, each with its own mean, inverse
-    covariance, and mixing weight. Uses L2-normalized features and relative
-    Mahalanobis distance for robust task identification.
+def _regularized_covariance(scatter, dof, shrinkage, ridge):
+    dim = scatter.shape[0]
+    covariance = scatter / max(float(dof), 1.0)
+    scale = covariance.diagonal().mean().clamp_min(ridge)
+    eye = torch.eye(dim, device=scatter.device, dtype=scatter.dtype)
+    covariance = (1.0 - shrinkage) * covariance + shrinkage * scale * eye
+    covariance = covariance + ridge * eye
+    chol, info = torch.linalg.cholesky_ex(covariance)
+    if int(info.max().item()) == 0:
+        return torch.cholesky_inverse(chol), 2.0 * torch.log(chol.diagonal()).sum()
+    sign, log_det = torch.linalg.slogdet(covariance)
+    if sign <= 0:
+        raise RuntimeError("Regularized covariance is not positive definite")
+    return torch.linalg.pinv(covariance, hermitian=True), log_det
+
+
+class GMMStatisticalMemory(nn.Module):
+    """Hard-assignment GMM memory for task-agnostic inference routing.
+
+    Components within a task share a shrinkage covariance. Feature
+    normalization is identical during fitting and inference, and Gaussian
+    log-determinants keep likelihoods from different tasks comparable.
 
     References:
         - CoGaMiD (NeurIPS/OpenReview): GMM for continual segmentation
         - Mahalanobis++ (OpenReview 2024): L2-norm before Mahalanobis
-        - RMD (UCL): Relative Mahalanobis Distance
     """
 
-    def __init__(self, feature_dim, max_tasks=10, num_components=3):
+    def __init__(
+        self,
+        feature_dim,
+        max_tasks=10,
+        num_components=3,
+        covariance_shrinkage=0.1,
+        covariance_ridge=1e-4,
+        temperature=1.0,
+    ):
         super().__init__()
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
         self.feature_dim = feature_dim
         self.max_tasks = max_tasks
         self.K = num_components
+        self.covariance_shrinkage = covariance_shrinkage
+        self.covariance_ridge = covariance_ridge
+        self.temperature = temperature
 
         # Per-task GMM parameters: K components each
         self.register_buffer(
@@ -96,127 +126,135 @@ class GMMStatisticalMemory(nn.Module):
         self.register_buffer(
             "mix_weights", torch.zeros(max_tasks, num_components))
         self.register_buffer(
+            "log_dets", torch.zeros(max_tasks, num_components))
+        self.register_buffer(
+            "task_valid", torch.zeros(max_tasks, dtype=torch.bool))
+        self.register_buffer(
             "task_count", torch.tensor(0, dtype=torch.long))
-
-        # Background distribution for Relative Mahalanobis Distance
-        self.register_buffer("bg_mean", torch.zeros(feature_dim))
-        self.register_buffer("bg_inv_cov", torch.zeros(feature_dim, feature_dim))
-        self.register_buffer("bg_valid", torch.tensor(False, dtype=torch.bool))
 
     @torch.no_grad()
     def update_statistics(self, task_id, features):
-        """Fit K-component GMM to L2-normalized features for a task."""
+        """Fit a hard-assignment GMM on consistently normalized features."""
+        if not 0 <= int(task_id) < self.max_tasks:
+            raise IndexError(f"task_id {task_id} is outside [0, {self.max_tasks})")
+        if features.ndim != 2 or features.shape[1] != self.feature_dim:
+            raise ValueError(
+                f"Expected features [N, {self.feature_dim}], got {tuple(features.shape)}"
+            )
+        if features.shape[0] == 0:
+            raise ValueError("Cannot fit statistical memory with no features")
 
-        # features = F.normalize(features, dim=1)  # Removed in Pillar 10
+        features = F.normalize(features.float(), dim=1)
         N, D = features.shape
+        component_count = min(self.K, N)
 
-        # --- K-Means initialization ---
-        indices = torch.randperm(N, device=features.device)[:self.K]
-        centroids = features[indices].clone()
+        # Deterministic farthest-point initialization.
+        first = torch.cdist(features, features.mean(dim=0, keepdim=True)).argmax()
+        centroids = [features[first].clone()]
+        for _ in range(1, component_count):
+            dists = torch.cdist(features, torch.stack(centroids))
+            centroids.append(features[dists.min(dim=1).values.argmax()].clone())
+        centroids = torch.stack(centroids)
+        assignments = torch.full((N,), -1, dtype=torch.long, device=features.device)
 
-        for _ in range(20):  # K-Means iterations
-            dists = torch.cdist(features, centroids)  # [N, K]
-            assignments = dists.argmin(dim=1)  # [N]
-            for k in range(self.K):
+        for _ in range(25):
+            dists = torch.cdist(features, centroids)
+            new_assignments = dists.argmin(dim=1)
+            if torch.equal(assignments, new_assignments):
+                break
+            assignments = new_assignments
+            for k in range(component_count):
                 mask = assignments == k
-                if mask.sum() > 0:
+                if mask.any():
                     centroids[k] = features[mask].mean(dim=0)
 
-        # --- Compute per-component statistics ---
-        final_dists = torch.cdist(features, centroids)
-        assignments = final_dists.argmin(dim=1)
-
-        # Fix #4: Tied Covariance Matrix to prevent Metric Space Mismatch
-        # Because N (e.g. 700) > D (256), but per-component samples < D,
-        # we compute a shared covariance matrix for all K components.
-        task_cov = torch.cov(features.T) + torch.eye(D, device=features.device) * 1e-4
-        task_inv_cov = torch.linalg.inv(task_cov)
-
-        for k in range(self.K):
+        # Pool within-component scatter and regularize it. This remains positive
+        # definite even when the sample count is below the feature dimension.
+        counts = torch.zeros(self.K, device=features.device)
+        scatter = torch.zeros(D, D, device=features.device)
+        self.mix_weights[task_id].zero_()
+        for k in range(component_count):
             mask = assignments == k
-            count = mask.sum().item()
+            count = int(mask.sum().item())
             if count > 0:
-                self.means[task_id, k] = features[mask].mean(dim=0)
-                self.inv_covs[task_id, k] = task_inv_cov
-                self.mix_weights[task_id, k] = count / N
-            else:
-                self.means[task_id, k] = centroids[k]
-                self.inv_covs[task_id, k] = task_inv_cov
-                self.mix_weights[task_id, k] = 1.0 / N
+                component_features = features[mask]
+                mean = component_features.mean(dim=0)
+                centered = component_features - mean
+                scatter.add_(centered.t() @ centered)
+                self.means[task_id, k].copy_(mean)
+                counts[k] = count
+
+        valid_components = int((counts > 0).sum().item())
+        precision, log_det = _regularized_covariance(
+            scatter,
+            N - valid_components,
+            self.covariance_shrinkage,
+            self.covariance_ridge,
+        )
+        for k in range(self.K):
+            self.inv_covs[task_id, k].copy_(precision)
+            self.log_dets[task_id, k].copy_(log_det)
+        self.mix_weights[task_id].copy_(counts / counts.sum().clamp_min(1.0))
+        self.task_valid[task_id] = True
 
         if task_id >= self.task_count.item():
             self.task_count.fill_(task_id + 1)
 
-        # --- Update background distribution (all tasks combined) ---
-        self._update_background(features)
-
-    @torch.no_grad()
-    def _update_background(self, new_features):
-        """Update running background distribution for Relative Mahalanobis."""
-        N, D = new_features.shape
-        bg_mean = new_features.mean(dim=0)
-        centered = new_features - bg_mean
-        bg_cov = (centered.t() @ centered) / (N - 1 + 1e-6)
-        bg_cov += torch.eye(D, device=new_features.device) * 1e-4
-
-        if self.bg_valid.item():
-            # Exponential moving average with existing background
-            alpha = 0.5
-            self.bg_mean.mul_(1 - alpha).add_(bg_mean * alpha)
-            old_cov = torch.linalg.inv(self.bg_inv_cov)
-            blended_cov = (1 - alpha) * old_cov + alpha * bg_cov
-            self.bg_inv_cov.copy_(torch.linalg.inv(blended_cov))
-        else:
-            self.bg_mean.copy_(bg_mean)
-            self.bg_inv_cov.copy_(torch.linalg.inv(bg_cov))
-            self.bg_valid.fill_(True)
-
-    def compute_task_scores(self, features):
-        """Compute relative GMM log-likelihood scores for task routing."""
-        # Fix #8: L2 Normalization removed to prevent Metric Space Mismatch. 
-        # GMM was trained on unnormalized features, so inference must use unnormalized features.
-        B, D = features.shape
+    def compute_task_logits(self, features):
+        """Compute proper Gaussian-mixture log likelihoods for each task."""
         num_tasks = self.task_count.item()
         if num_tasks == 0:
             return None
+        features = F.normalize(features.float(), dim=1)
 
-        # --- GMM log-likelihood per task ---
         task_scores = []
         for t in range(num_tasks):
+            if not self.task_valid[t]:
+                task_scores.append(
+                    torch.full(
+                        (features.shape[0],),
+                        -torch.inf,
+                        device=features.device,
+                        dtype=features.dtype,
+                    )
+                )
+                continue
             component_scores = []
             for k in range(self.K):
-                w = self.mix_weights[t, k].clamp_min(1e-8)
+                w = self.mix_weights[t, k]
+                if w <= 0:
+                    component_scores.append(
+                        torch.full(
+                            (features.shape[0],),
+                            -torch.inf,
+                            device=features.device,
+                            dtype=features.dtype,
+                        )
+                    )
+                    continue
                 mean = self.means[t, k]
                 inv_cov = self.inv_covs[t, k]
                 diff = features - mean
-                mahal = ((diff @ inv_cov) * diff).sum(dim=1)  # [B]
-                log_prob = torch.log(w) - 0.5 * mahal  # [B]
-                component_scores.append(log_prob.unsqueeze(1))
-            # LogSumExp over K components: marginalize
-            stacked = torch.cat(component_scores, dim=1)  # [B, K]
-            task_score = torch.logsumexp(stacked, dim=1)   # [B]
-            task_scores.append(task_score.unsqueeze(1))
+                mahal = ((diff @ inv_cov) * diff).sum(dim=1)
+                component_scores.append(
+                    torch.log(w) - 0.5 * (mahal + self.log_dets[t, k])
+                )
+            task_scores.append(
+                torch.logsumexp(torch.stack(component_scores, dim=1), dim=1)
+            )
+        return torch.stack(task_scores, dim=1)
 
-        task_scores = torch.cat(task_scores, dim=1)  # [B, num_tasks]
-
-        # --- Relative Mahalanobis: subtract background score ---
-        if self.bg_valid.item():
-            diff_bg = features - self.bg_mean
-            bg_mahal = ((diff_bg @ self.bg_inv_cov) * diff_bg).sum(dim=1, keepdim=True)
-            bg_score = -0.5 * bg_mahal  # [B, 1]
-            task_scores = task_scores - bg_score
-
-        # Temperature-scaled softmax
-        temperature = max(D, 1)
-        task_probs = F.softmax(task_scores / temperature, dim=1)
-        return task_probs
+    def compute_task_scores(self, features, temperature=None):
+        logits = self.compute_task_logits(features)
+        if logits is None:
+            return None
+        temperature = self.temperature if temperature is None else temperature
+        if temperature <= 0:
+            raise ValueError("temperature must be positive")
+        return F.softmax(logits / temperature, dim=1)
 
 class SFTAdapter(nn.Module):
-    """Spatial Feature Transform (SFT) for adapting frozen backbone.
-    
-    Transforms prompts into affine transformation parameters (gamma, beta)
-    to modulate the backbone features.
-    """
+    """Per-image FiLM adapter driven by a global prompt vector."""
     def __init__(self, in_channels, prompt_channels=None):
         super().__init__()
         if prompt_channels is None:
@@ -237,9 +275,55 @@ class SFTAdapter(nn.Module):
         nn.init.zeros_(self.conv_gamma[2].weight)
         nn.init.zeros_(self.conv_beta[2].weight)
 
+        self.register_buffer(
+            "nsp_input_cov", torch.zeros(prompt_channels, prompt_channels)
+        )
+        self.register_buffer(
+            "nsp_gamma_hidden_cov", torch.zeros(in_channels, in_channels)
+        )
+        self.register_buffer(
+            "nsp_beta_hidden_cov", torch.zeros(in_channels, in_channels)
+        )
+        self.register_buffer("nsp_input_count", torch.tensor(0, dtype=torch.long))
+        self.register_buffer(
+            "nsp_gamma_hidden_count", torch.tensor(0, dtype=torch.long)
+        )
+        self.register_buffer(
+            "nsp_beta_hidden_count", torch.tensor(0, dtype=torch.long)
+        )
+        self._collect_nsp = False
+
+    @torch.no_grad()
+    def set_nsp_collection(self, enabled):
+        self._collect_nsp = bool(enabled)
+
+    @torch.no_grad()
+    def _accumulate_covariance(self, values, covariance, count):
+        # Prompts are spatially constant in this architecture. Averaging avoids
+        # counting the same broadcast vector once per pixel.
+        vectors = values.detach().float().mean(dim=(-2, -1))
+        covariance.add_(vectors.t() @ vectors)
+        count.add_(vectors.shape[0])
+
     def forward(self, x, prompt):
-        gamma = self.conv_gamma(prompt)
-        beta = self.conv_beta(prompt)
+        gamma_hidden = self.conv_gamma[1](self.conv_gamma[0](prompt))
+        beta_hidden = self.conv_beta[1](self.conv_beta[0](prompt))
+        if self._collect_nsp:
+            self._accumulate_covariance(
+                prompt, self.nsp_input_cov, self.nsp_input_count
+            )
+            self._accumulate_covariance(
+                gamma_hidden,
+                self.nsp_gamma_hidden_cov,
+                self.nsp_gamma_hidden_count,
+            )
+            self._accumulate_covariance(
+                beta_hidden,
+                self.nsp_beta_hidden_cov,
+                self.nsp_beta_hidden_count,
+            )
+        gamma = self.conv_gamma[2](gamma_hidden)
+        beta = self.conv_beta[2](beta_hidden)
         return x * (1 + gamma) + beta
 
 
@@ -262,7 +346,14 @@ class PromptFuser(nn.Module):
         - CODA-Prompt (CVPR 2023): Attention-based prompt assembly
     """
 
-    def __init__(self, num_prompts, query_dim, value_shape, temperature=1.0):
+    def __init__(
+        self,
+        num_prompts,
+        query_dim,
+        value_shape,
+        temperature=1.0,
+        max_tasks=10,
+    ):
         super().__init__()
         self.num_prompts = num_prompts
         self.query_dim = query_dim
@@ -278,7 +369,10 @@ class PromptFuser(nn.Module):
         # Soft Mask Gating: stores normalized frequency profile per task
         # task_prompt_mask[t, p] = how relevant prompt p is to task t
         self.register_buffer(
-            "task_prompt_mask", torch.zeros(10, num_prompts), persistent=True)
+            "task_prompt_mask",
+            torch.zeros(max_tasks, num_prompts),
+            persistent=True,
+        )
             
         # Hard-freezing buffer: stores which prompts belong exclusively to old tasks
         self.register_buffer(
@@ -290,16 +384,19 @@ class PromptFuser(nn.Module):
 
     @torch.no_grad()
     def backup_protected_prompts(self):
-        """Backup protected prompts before training."""
+        """Backup all prompt slices that must remain immutable this task."""
         self.backup_keys = self.keys.data.clone()
         self.backup_values = self.values.data.clone()
         self.backup_attention = self.attention.data.clone()
 
+    def frozen_mask(self):
+        return self.protected_mask | ~self.active
+
     @torch.no_grad()
     def zero_protected_grads(self):
-        """Zero out gradients of protected prompts to prevent AdamW momentum buildup."""
-        if self.protected_mask.any():
-            mask = self.protected_mask
+        """Zero gradients for old prompts and future, inactive prompt slots."""
+        mask = self.frozen_mask()
+        if mask.any():
             if self.keys.grad is not None:
                 self.keys.grad[mask] = 0.0
             if self.values.grad is not None:
@@ -309,9 +406,9 @@ class PromptFuser(nn.Module):
 
     @torch.no_grad()
     def restore_protected_prompts(self):
-        """Restore protected prompts to combat optimizer weight decay."""
-        if self.backup_keys is not None and self.protected_mask.any():
-            mask = self.protected_mask
+        """Restore frozen slices after an optimizer step, including weight decay."""
+        mask = self.frozen_mask()
+        if self.backup_keys is not None and mask.any():
             self.keys.data[mask] = self.backup_keys[mask]
             self.values.data[mask] = self.backup_values[mask]
             self.attention.data[mask] = self.backup_attention[mask]
@@ -332,17 +429,15 @@ class PromptFuser(nn.Module):
         keys = F.normalize(self.keys, dim=1)
         attended = F.normalize(query[:, None, :] * self.attention[None, :, :], dim=2)
         logits = (attended * keys[None, :, :]).sum(dim=2) / self.temperature
-        if self.active is not None:
+        if self.training and self.active is not None:
             logits = logits.masked_fill(~self.active.to(logits.device)[None, :], -1e4)
 
         raw_logits = logits.clone()
 
-        # Additive log-masking mathematically zeros out Softmax for irrelevant tasks.
-        # CRITICAL FIX: Since logits are scaled by 1/temperature (e.g. 1/0.1 = 10),
-        # the mask penalty MUST also be scaled by 1/temperature to overpower the logits.
+        # Treat the routing mask as a multiplicative prior on attention weights:
+        # softmax(logits + log(mask)) is proportional to exp(logits) * mask.
         if soft_mask is not None:
-            # soft_mask: [B, num_prompts]
-            mask_penalty = torch.log(soft_mask.clamp(min=1e-8)) / self.temperature
+            mask_penalty = torch.log(soft_mask.clamp(min=1e-8))
             logits = logits + mask_penalty
 
         weights = F.softmax(logits, dim=1)
@@ -367,21 +462,21 @@ class PromptFuser(nn.Module):
 
     @torch.no_grad()
     def update_task_mask(self, task_id):
-        """Build task-prompt mask from accumulated frequency counts.
-
-        Normalizes the current frequency buffer to [0, 1] and stores it
-        as the affinity profile for this task. Also locks heavily used prompts.
-        """
-        freq = self.frequency.float()
-        max_freq = freq.max().clamp_min(1.0)
-        self.task_prompt_mask[task_id] = freq / max_freq
-        
-        # Lock heavily used prompts (e.g. > 50% relative usage) to prevent weight decay
-        new_protected = (freq / max_freq) > 0.5
-        self.protected_mask = self.protected_mask | new_protected
-        
-        # Reset frequency for the next task
+        """Assign the current private prompt block to a task and freeze it."""
+        if not 0 <= int(task_id) < self.task_prompt_mask.shape[0]:
+            raise IndexError(f"task_id {task_id} exceeds prompt memory capacity")
+        self.task_prompt_mask[task_id].zero_()
+        self.task_prompt_mask[task_id, self.active] = 1.0
+        self.protected_mask |= self.active
         self.frequency.fill_(1.0)
+
+    def task_mask(self, task_id, batch_size):
+        if not 0 <= int(task_id) < self.task_prompt_mask.shape[0]:
+            raise IndexError(f"task_id {task_id} exceeds prompt memory capacity")
+        mask = self.task_prompt_mask[task_id]
+        if not bool(mask.any().item()):
+            mask = self.active.float()
+        return mask.to(self.values.device).unsqueeze(0).expand(batch_size, -1)
 
     def compute_soft_mask(self, task_probs):
         """Convert task probabilities to per-prompt soft mask.
@@ -418,16 +513,12 @@ class PromptFuser(nn.Module):
 # ---------------------------------------------------------------------------
 
 class EcoDPLPromptIR(nn.Module):
-    """EcoSMH: EcoDPL enhanced with Statistical Memory and 3 vulnerability fixes.
+    """EcoSMH continual deraining model.
 
-    Fix #1: DWT Haar Wavelet extracts degradation-only features (discards LL).
-    Fix #2: Soft Mask Gating replaces additive Logit Fusion in PromptFuser.
-    Fix #3: GMM (K=3) + L2-Norm + Relative Mahalanobis replaces single Gaussian.
-
-    The backbone follows the PromptIR/Restormer-style implementation already in
-    this repository, while the continual-learning interface mirrors the TIP
-    paper: image prompts, feature prompts, P-Fuser, frequency tables,
-    Grad-Tuner, and optional parameter regularization from the trainer.
+    Training is boundary-aware and rehearsal-free. Inference can be
+    task-agnostic through the statistical router, or use an oracle ``task_id``
+    for diagnostics. Null-space protection is applied only to the FiLM adapter
+    weights; private prompt blocks are protected exactly by the trainer.
     """
 
     def __init__(
@@ -445,6 +536,9 @@ class EcoDPLPromptIR(nn.Module):
         image_prompt_size=32,
         grad_tuner_components=25,
         gmm_components=3,
+        max_tasks=10,
+        router_temperature=1.0,
+        covariance_shrinkage=0.1,
     ):
         super().__init__()
         if num_blocks is None:
@@ -453,14 +547,18 @@ class EcoDPLPromptIR(nn.Module):
             heads = [1, 2, 4, 8]
 
         self.num_prompts = num_prompts
+        self.max_tasks = max_tasks
         self.grad_tuner_components = grad_tuner_components
 
-        # Fix #3: GMM Statistical Memory (replaces single-Gaussian StatisticalMemory)
         self.stat_memory = GMMStatisticalMemory(
-            feature_dim=256, max_tasks=10, num_components=gmm_components)
+            feature_dim=256,
+            max_tasks=max_tasks,
+            num_components=gmm_components,
+            covariance_shrinkage=covariance_shrinkage,
+            temperature=router_temperature,
+        )
 
-        # Fix #1: Frozen VGG16 for degradation feature extraction
-        # Input will be DWT high-freq sub-bands instead of raw images
+        # The router sees high-frequency magnitudes, not a content-free signal.
         from torchvision.models import VGG16_Weights, vgg16
         self.frozen_extractor = vgg16(weights=VGG16_Weights.IMAGENET1K_V1).features[:16].eval()
         for param in self.frozen_extractor.parameters():
@@ -474,6 +572,7 @@ class EcoDPLPromptIR(nn.Module):
             num_prompts=num_prompts,
             query_dim=dim,
             value_shape=(dim, 1, 1),
+            max_tasks=max_tasks,
         )
         self.image_prompt_adapter = SFTAdapter(inp_channels, prompt_channels=dim)
 
@@ -509,6 +608,7 @@ class EcoDPLPromptIR(nn.Module):
             num_prompts=num_prompts,
             query_dim=self.latent_dim,
             value_shape=(self.latent_dim, 1, 1),
+            max_tasks=max_tasks,
         )
         self.feature_prompt_adapter = SFTAdapter(self.latent_dim)
 
@@ -543,10 +643,11 @@ class EcoDPLPromptIR(nn.Module):
         self.last_aux = {}
 
     def _extract_degradation_vector(self, inp_img):
-        """Extract degradation-only feature vector using DWT + VGG16.
+        """Extract a high-frequency VGG descriptor used only by the router.
 
         Pipeline: Image -> DWT (discard LL) -> VGG16 -> GAP -> L2-norm -> 256-d
         """
+        self.frozen_extractor.eval()
         with torch.no_grad():
             # Fix #1: DWT to separate degradation from content
             hf_img = extract_degradation_features(inp_img.clamp(0, 1))
@@ -555,27 +656,55 @@ class EcoDPLPromptIR(nn.Module):
             deg_features = self.frozen_extractor(hf_norm).mean(dim=(-2, -1))
         return deg_features
 
+    @torch.no_grad()
+    def route_task_probs(self, inp_img, max_side=256):
+        """Route once per image; callers can reuse the result for all tiles."""
+        if self.stat_memory.task_count.item() == 0:
+            return None
+        height, width = inp_img.shape[-2:]
+        if max(height, width) > max_side:
+            scale = max_side / max(height, width)
+            inp_img = F.interpolate(
+                inp_img,
+                size=(max(8, round(height * scale)), max(8, round(width * scale))),
+                mode="bilinear",
+                align_corners=False,
+            )
+        return self.stat_memory.compute_task_scores(
+            self._extract_degradation_vector(inp_img)
+        )
+
     @staticmethod
     def _match_skip(x, skip):
         if x.shape[-2:] == skip.shape[-2:]:
             return x
         return F.interpolate(x, size=skip.shape[-2:], mode="bilinear", align_corners=False)
 
-    def forward(self, inp_img, return_aux=False):
+    def forward(
+        self,
+        inp_img,
+        return_aux=False,
+        task_id=None,
+        routing_probs=None,
+    ):
         b, _, h, w = inp_img.shape
+        if task_id is not None and routing_probs is not None:
+            raise ValueError("Specify task_id or routing_probs, not both")
 
-        # --- Statistical Routing (Fixes #1 + #3) ---
+        # Route only at inference. Training uses the current private block.
         soft_mask_img = None
         soft_mask_feat = None
-        deg_features = self._extract_degradation_vector(inp_img)
-        if not self.training and self.stat_memory.task_count > 0:
-            task_probs = self.stat_memory.compute_task_scores(deg_features)
-            if task_probs is not None:
-                # Fix #2: Generate soft masks instead of logit offsets
-                soft_mask_img = self.image_fuser.compute_soft_mask(task_probs)
-                soft_mask_feat = self.feature_fuser.compute_soft_mask(task_probs)
+        deg_features = None
+        if task_id is not None:
+            soft_mask_img = self.image_fuser.task_mask(task_id, b)
+            soft_mask_feat = self.feature_fuser.task_mask(task_id, b)
+        else:
+            if routing_probs is None and not self.training:
+                routing_probs = self.route_task_probs(inp_img)
+            if routing_probs is not None:
+                soft_mask_img = self.image_fuser.compute_soft_mask(routing_probs)
+                soft_mask_feat = self.feature_fuser.compute_soft_mask(routing_probs)
 
-        # --- P-Fuser with Soft Mask Gating (Fix #2) ---
         query_feature = self.patch_embed_query(inp_img).mean(dim=(-2, -1))
         image_prompt, image_aux = self.image_fuser(
             query_feature, update_frequency=True, soft_mask=soft_mask_img)
@@ -645,21 +774,6 @@ class EcoDPLPromptIR(nn.Module):
             return restored, self.last_aux
         return restored
 
-    def prompt_regularization_loss(self):
-        image_keys = F.normalize(self.image_fuser.keys, dim=1)
-        feature_keys = F.normalize(self.feature_fuser.keys, dim=1)
-        image_eye = torch.eye(self.num_prompts, device=image_keys.device)
-        feature_eye = torch.eye(self.num_prompts, device=feature_keys.device)
-        return (
-            (image_keys @ image_keys.t() - image_eye).pow(2).mean()
-            + (feature_keys @ feature_keys.t() - feature_eye).pow(2).mean()
-        )
-
-    @torch.no_grad()
-    def grad_tune_prompts(self):
-        self.image_fuser.grad_tune(self.grad_tuner_components)
-        self.feature_fuser.grad_tune(self.grad_tuner_components)
-
     @torch.no_grad()
     def set_active_prompt_range(self, start=None, end=None):
         self.image_fuser.set_active_range(start, end)
@@ -685,44 +799,39 @@ class EcoDPLPromptIR(nn.Module):
         self.feature_fuser.restore_protected_prompts()
 
     @torch.no_grad()
+    def set_nsp_collection(self, enabled):
+        for module in self.modules():
+            if isinstance(module, SFTAdapter):
+                module.set_nsp_collection(enabled)
+
+    @torch.no_grad()
     def update_task_statistics(self, task_id, dataloader, device):
-        """Compute and store GMM anchors + prompt masks after training a task."""
+        """Consolidate router statistics, prompt ownership and NSP covariances."""
         training_state = self.training
-        self.eval()
         all_deg_features = []
-        all_latent_features = []
+        # Train mode intentionally bypasses statistical routing and selects only
+        # the active private prompt block. No gradients are recorded.
+        self.train(True)
+        self.set_nsp_collection(True)
+        try:
+            for batch in dataloader:
+                degraded = batch[1] if len(batch) == 3 else batch[0]
+                degraded = degraded.to(device, non_blocking=True)
+                pad_h = (8 - degraded.size(2) % 8) % 8
+                pad_w = (8 - degraded.size(3) % 8) % 8
+                if pad_h > 0 or pad_w > 0:
+                    degraded = F.pad(
+                        degraded, (0, pad_w, 0, pad_h), mode="reflect"
+                    )
 
-        for batch in dataloader:
-            if len(batch) == 3:
-                name, degraded, clean = batch
-            elif len(batch) == 2:
-                degraded, clean = batch
-            else:
-                degraded = batch[0]
-            degraded = degraded.to(device)
-            pad_h = (8 - degraded.size(2) % 8) % 8
-            pad_w = (8 - degraded.size(3) % 8) % 8
-            if pad_h > 0 or pad_w > 0:
-                import torch.nn.functional as F
-                degraded = F.pad(degraded, (0, pad_w, 0, pad_h), mode="reflect")
-            
-            # Forward pass to get latent features and deg features
-            _, aux = self.forward(degraded, return_aux=True)
-            all_deg_features.append(aux["deg_features"])
-            all_latent_features.append(aux["latent_query"])
+                self.forward(degraded)
+                all_deg_features.append(self._extract_degradation_vector(degraded))
+        finally:
+            self.set_nsp_collection(False)
+            self.train(training_state)
 
-        all_deg_features = torch.cat(all_deg_features, dim=0)
-        all_latent_features = torch.cat(all_latent_features, dim=0)
-
-        # Fix #3: Fit GMM to degradation features
-        self.stat_memory.update_statistics(task_id, all_deg_features)
-
-        # Fix #2: Store prompt usage mask for this task
+        if not all_deg_features:
+            raise ValueError("Cannot consolidate an empty task loader")
+        self.stat_memory.update_statistics(task_id, torch.cat(all_deg_features, dim=0))
         self.image_fuser.update_task_mask(task_id)
         self.feature_fuser.update_task_mask(task_id)
-
-        # Reset frequency counters for next task
-        self.image_fuser.frequency.fill_(1.0)
-        self.feature_fuser.frequency.fill_(1.0)
-
-        self.train(training_state)
