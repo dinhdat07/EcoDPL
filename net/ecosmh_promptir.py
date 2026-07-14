@@ -105,12 +105,9 @@ class GMMStatisticalMemory(nn.Module):
 
     @torch.no_grad()
     def update_statistics(self, task_id, features):
-        """Fit K-component GMM to L2-normalized features for a task.
+        """Fit K-component GMM to L2-normalized features for a task."""
 
-        Uses K-Means initialization followed by EM-style assignment to fit
-        GMM components. This avoids sklearn dependency.
-        """
-        features = F.normalize(features, dim=1)
+        # features = F.normalize(features, dim=1)  # Removed in Pillar 10
         N, D = features.shape
 
         # --- K-Means initialization ---
@@ -129,26 +126,23 @@ class GMMStatisticalMemory(nn.Module):
         final_dists = torch.cdist(features, centroids)
         assignments = final_dists.argmin(dim=1)
 
+        # Fix #4: Tied Covariance Matrix to prevent Metric Space Mismatch
+        # Because N (e.g. 700) > D (256), but per-component samples < D,
+        # we compute a shared covariance matrix for all K components.
+        task_cov = torch.cov(features.T) + torch.eye(D, device=features.device) * 1e-4
+        task_inv_cov = torch.linalg.inv(task_cov)
+
         for k in range(self.K):
             mask = assignments == k
             count = mask.sum().item()
-            if count < D + 1:
-                # Not enough samples, fall back to centroid + identity cov
+            if count > 0:
+                self.means[task_id, k] = features[mask].mean(dim=0)
+                self.inv_covs[task_id, k] = task_inv_cov
+                self.mix_weights[task_id, k] = count / N
+            else:
                 self.means[task_id, k] = centroids[k]
-                self.inv_covs[task_id, k] = torch.eye(D, device=features.device)
-                self.mix_weights[task_id, k] = max(count, 1) / N
-                continue
-
-            cluster_features = features[mask]
-            mean = cluster_features.mean(dim=0)
-            centered = cluster_features - mean
-            cov = (centered.t() @ centered) / (count - 1 + 1e-6)
-            cov += torch.eye(D, device=features.device) * 1e-4  # Ridge
-            inv_cov = torch.linalg.inv(cov)
-
-            self.means[task_id, k] = mean
-            self.inv_covs[task_id, k] = inv_cov
-            self.mix_weights[task_id, k] = count / N
+                self.inv_covs[task_id, k] = task_inv_cov
+                self.mix_weights[task_id, k] = 1.0 / N
 
         if task_id >= self.task_count.item():
             self.task_count.fill_(task_id + 1)
@@ -178,12 +172,9 @@ class GMMStatisticalMemory(nn.Module):
             self.bg_valid.fill_(True)
 
     def compute_task_scores(self, features):
-        """Compute relative GMM log-likelihood scores for task routing.
-
-        Returns:
-            task_probs: [B, num_tasks] probability vector via softmax.
-        """
-        features = F.normalize(features, dim=1)
+        """Compute relative GMM log-likelihood scores for task routing."""
+        # Fix #8: L2 Normalization removed to prevent Metric Space Mismatch. 
+        # GMM was trained on unnormalized features, so inference must use unnormalized features.
         B, D = features.shape
         num_tasks = self.task_count.item()
         if num_tasks == 0:
@@ -226,18 +217,25 @@ class SFTAdapter(nn.Module):
     Transforms prompts into affine transformation parameters (gamma, beta)
     to modulate the backbone features.
     """
-    def __init__(self, in_channels):
+    def __init__(self, in_channels, prompt_channels=None):
         super().__init__()
+        if prompt_channels is None:
+            prompt_channels = in_channels
         self.conv_gamma = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.Conv2d(prompt_channels, in_channels, 1, padding=0, bias=False),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(in_channels, in_channels, 3, padding=1)
+            nn.Conv2d(in_channels, in_channels, 1, padding=0, bias=False)
         )
         self.conv_beta = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels, 3, padding=1),
+            nn.Conv2d(prompt_channels, in_channels, 1, padding=0, bias=False),
             nn.LeakyReLU(0.1, inplace=True),
-            nn.Conv2d(in_channels, in_channels, 3, padding=1)
+            nn.Conv2d(in_channels, in_channels, 1, padding=0, bias=False)
         )
+        
+        # Fix #6: Adapter Initialization Trap. Must zero-initialize the final layers
+        # so that the adapter acts as an identity mapping at the start of training.
+        nn.init.zeros_(self.conv_gamma[2].weight)
+        nn.init.zeros_(self.conv_beta[2].weight)
 
     def forward(self, x, prompt):
         gamma = self.conv_gamma(prompt)
@@ -298,6 +296,18 @@ class PromptFuser(nn.Module):
         self.backup_attention = self.attention.data.clone()
 
     @torch.no_grad()
+    def zero_protected_grads(self):
+        """Zero out gradients of protected prompts to prevent AdamW momentum buildup."""
+        if self.protected_mask.any():
+            mask = self.protected_mask
+            if self.keys.grad is not None:
+                self.keys.grad[mask] = 0.0
+            if self.values.grad is not None:
+                self.values.grad[mask] = 0.0
+            if self.attention.grad is not None:
+                self.attention.grad[mask] = 0.0
+
+    @torch.no_grad()
     def restore_protected_prompts(self):
         """Restore protected prompts to combat optimizer weight decay."""
         if self.backup_keys is not None and self.protected_mask.any():
@@ -327,13 +337,12 @@ class PromptFuser(nn.Module):
 
         raw_logits = logits.clone()
 
-        # --- Additive Soft Mask Gating (Fix #2 + Fix Flaw) ---
-        # Additive log-masking mathematically zeros out Softmax for irrelevant tasks
-        # preserving P-Fuser's instance-adaptive selection cleanly.
+        # Additive log-masking mathematically zeros out Softmax for irrelevant tasks.
+        # CRITICAL FIX: Since logits are scaled by 1/temperature (e.g. 1/0.1 = 10),
+        # the mask penalty MUST also be scaled by 1/temperature to overpower the logits.
         if soft_mask is not None:
-            # soft_mask: [B, num_prompts], values typically in [0.0, 1.0]
-            # Add log of mask. If mask -> 0, penalty -> -inf (blocks prompt entirely)
-            mask_penalty = torch.log(soft_mask.clamp(min=1e-6))
+            # soft_mask: [B, num_prompts]
+            mask_penalty = torch.log(soft_mask.clamp(min=1e-8)) / self.temperature
             logits = logits + mask_penalty
 
         weights = F.softmax(logits, dim=1)
@@ -464,48 +473,52 @@ class EcoDPLPromptIR(nn.Module):
         self.image_fuser = PromptFuser(
             num_prompts=num_prompts,
             query_dim=dim,
-            value_shape=(inp_channels, image_prompt_size, image_prompt_size),
+            value_shape=(dim, 1, 1),
         )
-        self.image_prompt_adapter = SFTAdapter(inp_channels)
+        self.image_prompt_adapter = SFTAdapter(inp_channels, prompt_channels=dim)
 
         self.patch_embed = OverlapPatchEmbed(inp_channels, dim)
         self.encoder_level1 = nn.Sequential(*[
             TransformerBlock(dim=dim, num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[0])
         ])
+        self.adapter_enc_level1 = SFTAdapter(in_channels=dim, prompt_channels=dim)
 
         self.down1_2 = Downsample(dim)
         self.encoder_level2 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[1])
         ])
+        self.adapter_enc_level2 = SFTAdapter(in_channels=int(dim * 2), prompt_channels=dim)
 
         self.down2_3 = Downsample(int(dim * 2))
         self.encoder_level3 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 4), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[2])
         ])
+        self.adapter_enc_level3 = SFTAdapter(in_channels=int(dim * 4), prompt_channels=dim)
 
         self.down3_4 = Downsample(int(dim * 4))
-        latent_dim = int(dim * 8)
+        self.latent_dim = int(dim * 8)
         self.latent = nn.Sequential(*[
-            TransformerBlock(dim=latent_dim, num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
+            TransformerBlock(dim=self.latent_dim, num_heads=heads[3], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[3])
         ])
 
         self.feature_fuser = PromptFuser(
             num_prompts=num_prompts,
-            query_dim=latent_dim,
-            value_shape=(latent_dim, 1, 1),
+            query_dim=self.latent_dim,
+            value_shape=(self.latent_dim, 1, 1),
         )
-        self.feature_prompt_adapter = SFTAdapter(latent_dim)
+        self.feature_prompt_adapter = SFTAdapter(self.latent_dim)
 
-        self.up4_3 = Upsample(latent_dim)
-        self.reduce_chan_level3 = nn.Conv2d(int(dim * 8), int(dim * 4), 1, bias=bias)
+        self.up4_3 = Upsample(self.latent_dim)
+        self.reduce_chan_level3 = nn.Conv2d(int(dim * 8), int(dim * 4), kernel_size=1, bias=bias)
         self.decoder_level3 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 4), num_heads=heads[2], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[2])
         ])
+        self.adapter_dec_level3 = SFTAdapter(in_channels=int(dim * 4), prompt_channels=self.latent_dim)
 
         self.up3_2 = Upsample(int(dim * 4))
         self.reduce_chan_level2 = nn.Conv2d(int(dim * 4), int(dim * 2), 1, bias=bias)
@@ -513,12 +526,14 @@ class EcoDPLPromptIR(nn.Module):
             TransformerBlock(dim=int(dim * 2), num_heads=heads[1], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[1])
         ])
+        self.adapter_dec_level2 = SFTAdapter(in_channels=int(dim * 2), prompt_channels=self.latent_dim)
 
         self.up2_1 = Upsample(int(dim * 2))
         self.decoder_level1 = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
             for _ in range(num_blocks[0])
         ])
+        self.adapter_dec_level1 = SFTAdapter(in_channels=int(dim * 2), prompt_channels=self.latent_dim)
 
         self.refinement = nn.Sequential(*[
             TransformerBlock(dim=int(dim * 2), num_heads=heads[0], ffn_expansion_factor=ffn_expansion_factor, bias=bias, LayerNorm_type=layer_norm_type)
@@ -553,8 +568,7 @@ class EcoDPLPromptIR(nn.Module):
         soft_mask_img = None
         soft_mask_feat = None
         deg_features = self._extract_degradation_vector(inp_img)
-
-        if not self.training:
+        if not self.training and self.stat_memory.task_count > 0:
             task_probs = self.stat_memory.compute_task_scores(deg_features)
             if task_probs is not None:
                 # Fix #2: Generate soft masks instead of logit offsets
@@ -565,33 +579,54 @@ class EcoDPLPromptIR(nn.Module):
         query_feature = self.patch_embed_query(inp_img).mean(dim=(-2, -1))
         image_prompt, image_aux = self.image_fuser(
             query_feature, update_frequency=True, soft_mask=soft_mask_img)
-        image_prompt = F.interpolate(image_prompt, size=(h, w), mode="bilinear", align_corners=False)
+        image_prompt = image_prompt.expand(-1, -1, h, w)
         prompted_img = self.image_prompt_adapter(inp_img, image_prompt)
 
         out_enc_level1 = self.encoder_level1(self.patch_embed(prompted_img))
+        
+        prompt_level1 = F.interpolate(image_prompt, size=out_enc_level1.shape[-2:], mode="bilinear", align_corners=False)
+        out_enc_level1 = self.adapter_enc_level1(out_enc_level1, prompt_level1)
+        
         out_enc_level2 = self.encoder_level2(self.down1_2(out_enc_level1))
+        
+        prompt_level2 = F.interpolate(image_prompt, size=out_enc_level2.shape[-2:], mode="bilinear", align_corners=False)
+        out_enc_level2 = self.adapter_enc_level2(out_enc_level2, prompt_level2)
+        
         out_enc_level3 = self.encoder_level3(self.down2_3(out_enc_level2))
+        
+        prompt_level3 = F.interpolate(image_prompt, size=out_enc_level3.shape[-2:], mode="bilinear", align_corners=False)
+        out_enc_level3 = self.adapter_enc_level3(out_enc_level3, prompt_level3)
+        
         latent = self.latent(self.down3_4(out_enc_level3))
 
         feature_query = latent.mean(dim=(-2, -1))
+
         feature_prompt, feature_aux = self.feature_fuser(
             feature_query, update_frequency=True, soft_mask=soft_mask_feat)
         feature_prompt = feature_prompt.expand(b, -1, latent.shape[-2], latent.shape[-1])
-        latent = self.feature_prompt_adapter(latent, feature_prompt)
+        prompted_latent = self.feature_prompt_adapter(latent, feature_prompt)
+        
+        # Decoder passes
+        out_dec_level3 = self.up4_3(prompted_latent)
+        out_dec_level3 = torch.cat([out_dec_level3, out_enc_level3], 1)
+        out_dec_level3 = self.reduce_chan_level3(out_dec_level3)
+        out_dec_level3 = self.decoder_level3(out_dec_level3)
+        prompt_dec3 = F.interpolate(feature_prompt, size=out_dec_level3.shape[-2:], mode="bilinear", align_corners=False)
+        out_dec_level3 = self.adapter_dec_level3(out_dec_level3, prompt_dec3)
 
-        inp_dec_level3 = self.up4_3(latent)
-        inp_dec_level3 = self._match_skip(inp_dec_level3, out_enc_level3)
-        inp_dec_level3 = self.reduce_chan_level3(torch.cat([inp_dec_level3, out_enc_level3], dim=1))
-        out_dec_level3 = self.decoder_level3(inp_dec_level3)
+        out_dec_level2 = self.up3_2(out_dec_level3)
+        out_dec_level2 = torch.cat([out_dec_level2, out_enc_level2], 1)
+        out_dec_level2 = self.reduce_chan_level2(out_dec_level2)
+        out_dec_level2 = self.decoder_level2(out_dec_level2)
+        prompt_dec2 = F.interpolate(feature_prompt, size=out_dec_level2.shape[-2:], mode="bilinear", align_corners=False)
+        out_dec_level2 = self.adapter_dec_level2(out_dec_level2, prompt_dec2)
 
-        inp_dec_level2 = self.up3_2(out_dec_level3)
-        inp_dec_level2 = self._match_skip(inp_dec_level2, out_enc_level2)
-        inp_dec_level2 = self.reduce_chan_level2(torch.cat([inp_dec_level2, out_enc_level2], dim=1))
-        out_dec_level2 = self.decoder_level2(inp_dec_level2)
+        out_dec_level1 = self.up2_1(out_dec_level2)
+        out_dec_level1 = torch.cat([out_dec_level1, out_enc_level1], 1)
+        out_dec_level1 = self.decoder_level1(out_dec_level1)
+        prompt_dec1 = F.interpolate(feature_prompt, size=out_dec_level1.shape[-2:], mode="bilinear", align_corners=False)
+        out_dec_level1 = self.adapter_dec_level1(out_dec_level1, prompt_dec1)
 
-        inp_dec_level1 = self.up2_1(out_dec_level2)
-        inp_dec_level1 = self._match_skip(inp_dec_level1, out_enc_level1)
-        out_dec_level1 = self.decoder_level1(torch.cat([inp_dec_level1, out_enc_level1], dim=1))
         out_dec_level1 = self.refinement(out_dec_level1)
 
         restored = self.output(out_dec_level1) + inp_img
@@ -603,6 +638,7 @@ class EcoDPLPromptIR(nn.Module):
             "image_logits": image_aux["logits"],
             "feature_logits": feature_aux["logits"],
             "deg_features": deg_features,
+            "latent_query": feature_query,
         }
 
         if return_aux:
@@ -654,6 +690,7 @@ class EcoDPLPromptIR(nn.Module):
         training_state = self.training
         self.eval()
         all_deg_features = []
+        all_latent_features = []
 
         for batch in dataloader:
             if len(batch) == 3:
@@ -663,10 +700,19 @@ class EcoDPLPromptIR(nn.Module):
             else:
                 degraded = batch[0]
             degraded = degraded.to(device)
-            deg_features = self._extract_degradation_vector(degraded)
-            all_deg_features.append(deg_features)
+            pad_h = (8 - degraded.size(2) % 8) % 8
+            pad_w = (8 - degraded.size(3) % 8) % 8
+            if pad_h > 0 or pad_w > 0:
+                import torch.nn.functional as F
+                degraded = F.pad(degraded, (0, pad_w, 0, pad_h), mode="reflect")
+            
+            # Forward pass to get latent features and deg features
+            _, aux = self.forward(degraded, return_aux=True)
+            all_deg_features.append(aux["deg_features"])
+            all_latent_features.append(aux["latent_query"])
 
         all_deg_features = torch.cat(all_deg_features, dim=0)
+        all_latent_features = torch.cat(all_latent_features, dim=0)
 
         # Fix #3: Fit GMM to degradation features
         self.stat_memory.update_statistics(task_id, all_deg_features)

@@ -38,6 +38,16 @@ class DWTExtractor(nn.Module):
             # Extract high-freq subbands: LH, HL, HH
             high_freqs = self.conv(gray) # [B, 3, H/2, W/2]
             
+            # CRITICAL FIX: Haar DWT outputs negative values for edges in certain directions.
+            # VGG's ReLU will kill 50% of the edge information if we feed it raw DWT outputs.
+            # 1. Take absolute value to get edge magnitude.
+            high_freqs = torch.abs(high_freqs)
+            
+            # 2. Normalize using ImageNet statistics to match VGG16's pre-training domain
+            mean = torch.tensor([0.485, 0.456, 0.406], device=x.device).view(1, 3, 1, 1)
+            std = torch.tensor([0.229, 0.224, 0.225], device=x.device).view(1, 3, 1, 1)
+            high_freqs = (high_freqs - mean) / std
+            
             # Pass through VGG
             features = self.feature_extractor(high_freqs)
             

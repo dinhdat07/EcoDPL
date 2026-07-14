@@ -39,6 +39,73 @@ class VGGPerceptualLoss(torch.nn.Module):
         return F.mse_loss(self.features(pred), self.features(target))
 
 
+class ParameterRegularizer:
+    def __init__(self, device, normalize_importance=True, mode="l1", importance_floor=0.0):
+        self.device = device
+        self.normalize_importance = normalize_importance
+        self.mode = mode
+        self.importance_floor = importance_floor
+        self.star = None
+        self.importance = None
+
+    def penalty(self, model):
+        if self.star is None or self.importance is None:
+            return torch.tensor(0.0, device=self.device)
+        total = torch.tensor(0.0, device=self.device)
+        count = 0
+        for param, star, importance in zip(model.parameters(), self.star, self.importance):
+            if not param.requires_grad:
+                continue
+            importance = importance.to(param.device)
+            if self.normalize_importance:
+                importance = importance / importance.detach().mean().clamp_min(1e-12)
+            if self.importance_floor > 0:
+                importance = importance + self.importance_floor
+            diff = param - star.to(param.device)
+            if self.mode == "l2":
+                total = total + torch.mean(importance * diff.square())
+            else:
+                total = total + torch.mean(importance * diff.abs())
+            count += 1
+        return total / max(count, 1)
+
+    @torch.no_grad()
+    def consolidate(self, model, loader, max_batches=50, pad_multiple=8, microbatch_size=4, use_amp=False, no_progress=False):
+        model.train()
+        importance = [torch.zeros_like(param, device=self.device) for param in model.parameters()]
+        seen = 0
+        for degraded, clean in tqdm(loader, total=min(len(loader), max_batches), desc="importance", leave=False, disable=no_progress):
+            degraded = degraded.to(self.device, non_blocking=True)
+            clean = clean.to(self.device, non_blocking=True)
+            model.zero_grad(set_to_none=True)
+            with torch.enable_grad():
+                if microbatch_size is None or microbatch_size <= 0:
+                    microbatch_size = degraded.shape[0]
+                degraded_chunks = degraded.split(microbatch_size)
+                clean_chunks = clean.split(microbatch_size)
+                chunk_count = len(degraded_chunks)
+                for degraded_chunk, clean_chunk in zip(degraded_chunks, clean_chunks):
+                    original_shape = degraded_chunk.shape[-2:]
+                    if pad_multiple and pad_multiple > 1:
+                        degraded_chunk, _ = pad_to_multiple(degraded_chunk, multiple=pad_multiple)
+                    with autocast_context(self.device, use_amp):
+                        restored = model(degraded_chunk)
+                        restored = crop_to_shape(restored, original_shape)
+                        loss = F.smooth_l1_loss(restored, clean_chunk) / chunk_count
+                    loss.backward()
+            for slot, param in zip(importance, model.parameters()):
+                if param.grad is not None:
+                    slot.add_(param.grad.detach().abs())
+            seen += 1
+            if seen >= max_batches:
+                break
+        if seen > 0:
+            importance = [slot / seen for slot in importance]
+        self.importance = importance
+        self.star = [param.detach().clone() for param in model.parameters()]
+        model.zero_grad(set_to_none=True)
+
+
 def build_train_loader(args, task, batch_size=None):
     train_set = H5DerainDataset(args.data_root, task, patch_size=args.patch_size, augment=True)
     return DataLoader(
@@ -142,11 +209,6 @@ def load_model_weights(path, model, device):
 
 
 def configure_trainable_parameters(model, scope, task_index):
-    # In EcoSMH we FREEZE BACKBONE for Task > 0.
-    if task_index == 0 and scope != "all":
-        print(f"Task 0 Warm-up: Forcing trainable_scope='all' to learn backbone representation.")
-        scope = "all"
-
     for param in model.parameters():
         param.requires_grad = False
 
@@ -159,12 +221,17 @@ def configure_trainable_parameters(model, scope, task_index):
     trainable_markers = {
         "prompts": ("image_fuser", "feature_fuser"),
         "prompts_adapters": ("image_fuser", "feature_fuser", "image_prompt_adapter", "feature_prompt_adapter"),
-        "prompts_adapters_output": (
+        "ppa_scope": (
             "image_fuser",
             "feature_fuser",
             "image_prompt_adapter",
+            "adapter_enc_level1",
+            "adapter_enc_level2",
+            "adapter_enc_level3",
             "feature_prompt_adapter",
-            "output",
+            "adapter_dec_level3",
+            "adapter_dec_level2",
+            "adapter_dec_level1",
         ),
     }[scope]
     
@@ -197,9 +264,10 @@ def main():
     parser.add_argument("--resume-state", default=None)
     parser.add_argument(
         "--trainable-scope",
-        choices=["all", "prompts", "prompts_adapters", "prompts_adapters_output"],
-        default="prompts_adapters_output",  # Default to backbone freeze
+        choices=["all", "prompts", "prompts_adapters", "decoder_prompts", "auto"],
+        default="auto",
     )
+
     parser.add_argument("--epochs-per-task", type=int, default=50)
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--patch-size", type=int, default=100)
@@ -214,7 +282,6 @@ def main():
     # Loss scaling parameters for aux distillation
     parser.add_argument("--zeta", type=float, default=1e-5)
     parser.add_argument("--eta", type=float, default=1e-5)
-    parser.add_argument("--prompt-reg", type=float, default=1e-4)
     
     parser.add_argument("--num-prompts", type=int, default=100)
     
@@ -249,6 +316,7 @@ def main():
         
     perceptual = None if args.no_perceptual else VGGPerceptualLoss().to(device)
     scaler = build_grad_scaler(device, args.amp)
+    from null_space import compute_null_space_projectors, apply_null_space_projection
 
     metrics_path = os.path.join(args.output_dir, "metrics.csv")
     os.makedirs(args.output_dir, exist_ok=True)
@@ -260,9 +328,20 @@ def main():
         task_index = args.initial_task_index + local_task_index
         train_loader, eval_loader = build_loaders(args, task)
         best_metric = -1.0
-        
+        # --- Allocate active prompts progressively ---
+        total_tasks = 5 # EcoDPL has 5 tasks usually
+        prompts_per_task = args.num_prompts // total_tasks
+        # Cap the max prompts to num_prompts
+        current_active_end = min(args.num_prompts, (task_index + 1) * prompts_per_task)
+        model.set_active_prompt_range(0, current_active_end)
+        print(f"[Prompts] Activated range 0 to {current_active_end} for task {task_index}", flush=True)
+
         # --- Task-specific optimizer and trainable parameters ---
-        configure_trainable_parameters(model, args.trainable_scope, task_index)
+        current_scope = args.trainable_scope
+        if current_scope == "auto":
+            current_scope = "all" if task_index == 0 else "ppa_scope"
+            
+        configure_trainable_parameters(model, current_scope, task_index)
         trainable_parameters = [param for param in model.parameters() if param.requires_grad]
         if not trainable_parameters:
             raise ValueError(f"No trainable parameters for trainable scope: {args.trainable_scope}")
@@ -277,6 +356,13 @@ def main():
 
         # Before training a new task, backup protected prompts
         model.backup_protected_prompts()
+        
+        # Compute Null Space projectors for SFTAdapters
+        if task_index > 0:
+            P_null_dict = compute_null_space_projectors(model, args.patch_size)
+            print(f"[NSP] Computed {len(P_null_dict)} projectors.")
+        else:
+            P_null_dict = {}
 
         for epoch in range(1, args.epochs_per_task + 1):
             model.train()
@@ -299,7 +385,6 @@ def main():
                     restored = crop_to_shape(restored, original_shape)
                     loss = args.alpha * F.smooth_l1_loss(restored, clean)
                     loss = loss + args.zeta * aux["image_distance"] + args.eta * aux["feature_distance"]
-                    loss = loss + args.prompt_reg * model.prompt_regularization_loss()
 
                 if perceptual is not None and args.perceptual_weight > 0:
                     with autocast_context(device, False):
@@ -309,13 +394,37 @@ def main():
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    
+                    # Prevent AdamW momentum explosion for frozen protected prompts
+                    if task_index > 0:
+                        model.zero_protected_prompt_grads()
+                    
+                    if task_index > 0:
+                        old_weights = {name: p.data.clone() for name, p in model.named_parameters() if p.requires_grad}
+                        
                     scaler.step(optimizer)
                     scaler.update()
+                    
+                    if task_index > 0:
+                        apply_null_space_projection(model, P_null_dict, old_weights)
+                        
                     optimizer_steps += 1
                 else:
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                    
+                    # Prevent AdamW momentum explosion for frozen protected prompts
+                    if task_index > 0:
+                        model.zero_protected_prompt_grads()
+                    
+                    if task_index > 0:
+                        old_weights = {name: p.data.clone() for name, p in model.named_parameters() if p.requires_grad}
+                        
                     optimizer.step()
+                    
+                    if task_index > 0:
+                        apply_null_space_projection(model, P_null_dict, old_weights)
+                        
                     optimizer_steps += 1
 
                 # Restore protected prompts to reverse any weight decay from AdamW
@@ -323,7 +432,8 @@ def main():
 
                 running_loss += loss.item()
                 steps_this_epoch = step
-                progress.set_postfix(loss=f"{loss.item():.4f}")
+                postfix_dict = {"loss": f"{loss.item():.4f}"}
+                progress.set_postfix(**postfix_dict)
                 if args.max_steps_per_epoch is not None and step >= args.max_steps_per_epoch:
                     break
 
